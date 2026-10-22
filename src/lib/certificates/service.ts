@@ -1,5 +1,4 @@
 import { createHash } from "crypto";
-import { mkdir, writeFile } from "fs/promises";
 import path from "path";
 import { Readable } from "stream";
 import type { Certificate } from "@prisma/client";
@@ -327,12 +326,7 @@ async function certifyImage(
 
   const createdAt = new Date();
   const storageKey = `${certId}/${path.parse(originalName).name || "image"}.png`;
-  const storage = getStorage();
-  const absPath =
-    storage.resolvePath?.(storageKey) ??
-    path.join(config.storageDir, storageKey);
-  await mkdir(path.dirname(absPath), { recursive: true });
-  await writeFile(absPath, pngBytes);
+  await getStorage().put(storageKey, pngBytes);
 
   const cert = await persistCertificate({
     certId,
@@ -419,13 +413,7 @@ async function certifyGeneric(
   const hashResult = await hashBuffer(bytes);
 
   const storageKey = `${certId}/${originalName}`;
-  const storage = getStorage();
-  const absPath =
-    storage.resolvePath?.(storageKey) ??
-    path.join(config.storageDir, storageKey);
-
-  await mkdir(path.dirname(absPath), { recursive: true });
-  await writeFile(absPath, bytes);
+  await getStorage().put(storageKey, bytes);
 
   const createdAt = new Date();
   const cert = await persistCertificate({

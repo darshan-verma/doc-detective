@@ -80,3 +80,4 @@ plan.md
 *.bak
 *.tmp
 .cache/
+.env*.local
