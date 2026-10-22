@@ -9,19 +9,37 @@ export { VercelBlobStorage } from "./vercel-blob";
 
 let storage: StorageProvider | null = null;
 
+function isVercelRuntime(): boolean {
+  return process.env.VERCEL === "1" || Boolean(process.env.VERCEL_ENV);
+}
+
 function createStorage(): StorageProvider {
   const config = getConfig();
   const provider = config.storageProvider;
+
   if (provider === "blob") {
     return new VercelBlobStorage();
   }
+
   if (provider === "local") {
+    if (isVercelRuntime()) {
+      throw new Error(
+        "STORAGE_PROVIDER=local cannot run on Vercel (read-only filesystem). " +
+          "Use STORAGE_PROVIDER=blob or auto, and ensure a Blob store is linked.",
+      );
+    }
     return new LocalDiskStorage(config.storageDir);
   }
-  // auto: prefer Blob when a token is configured (Vercel / local after env pull)
-  if (process.env.BLOB_READ_WRITE_TOKEN) {
+
+  // auto: never use local disk on Vercel — /var/task is read-only
+  if (
+    isVercelRuntime() ||
+    process.env.BLOB_READ_WRITE_TOKEN ||
+    process.env.BLOB_STORE_ID
+  ) {
     return new VercelBlobStorage();
   }
+
   return new LocalDiskStorage(config.storageDir);
 }
 
