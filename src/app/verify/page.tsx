@@ -114,25 +114,33 @@ function VerifyInner() {
   const searchParams = useSearchParams();
   const [certId, setCertId] = useState("");
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<VerifyResponse | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [reportHash, setReportHash] = useState<string | null>(null);
   const [reportBusy, setReportBusy] = useState(false);
   const [reportError, setReportError] = useState<string | null>(null);
+  const [fromQr, setFromQr] = useState(false);
   const autoRan = useRef(false);
 
   useEffect(() => {
     const fromQuery = searchParams.get("certId");
-    if (fromQuery) setCertId(fromQuery);
+    if (fromQuery) {
+      setCertId(fromQuery);
+      setFromQr(true);
+    }
   }, [searchParams]);
 
   const runVerify = useCallback(async (file: File, certIdOverride?: string) => {
     setBusy(true);
+    setProgress(`Uploading ${file.name}…`);
     setError(null);
     setResult(null);
     setReportHash(null);
     setReportError(null);
+    setSelectedFile(file);
     setUploadedFile(file);
 
     const resolvedCertId = (certIdOverride ?? certId).trim();
@@ -143,6 +151,7 @@ function VerifyInner() {
       form.append("file", file);
       if (resolvedCertId) form.append("certId", resolvedCertId);
 
+      setProgress("Verifying against certificate…");
       const res = await fetch("/api/verify", { method: "POST", body: form });
       const data = await res.json();
       if (!res.ok) {
@@ -152,12 +161,15 @@ function VerifyInner() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Verification failed");
     } finally {
+      setProgress(null);
       setBusy(false);
     }
   }, [certId]);
 
-  async function handleFile(file: File) {
-    await runVerify(file);
+  function handleFile(file: File) {
+    setSelectedFile(file);
+    setError(null);
+    setResult(null);
   }
 
   // Auto-run when arriving from certify "Verify against that certificate"
@@ -172,10 +184,12 @@ function VerifyInner() {
 
   function resetForAnother() {
     setResult(null);
+    setSelectedFile(null);
     setUploadedFile(null);
     setReportHash(null);
     setReportError(null);
     setError(null);
+    setProgress(null);
   }
 
   async function downloadReport() {
@@ -243,12 +257,57 @@ function VerifyInner() {
             <input
               type="text"
               value={certId}
-              onChange={(e) => setCertId(e.target.value)}
+              onChange={(e) => {
+                setCertId(e.target.value);
+                setFromQr(false);
+              }}
               placeholder="DD-… or legacy ID"
               className="mt-1 w-full rounded-md border border-zinc-300 px-3 py-2 font-mono text-sm tracking-wider outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500"
             />
           </label>
-          <FileDropzone onFile={handleFile} disabled={busy} />
+          {certId.trim() && (
+            <p className="text-xs text-zinc-600">
+              {fromQr
+                ? "Certificate loaded from your link/QR. Upload the file you want to check, then click Verify."
+                : "Upload the file to compare against this certificate, then click Verify."}{" "}
+              <Link
+                href={`/certificate/${encodeURIComponent(certId.trim())}`}
+                className="text-sky-700 underline"
+              >
+                View certificate
+              </Link>
+            </p>
+          )}
+          <FileDropzone
+            onFile={handleFile}
+            disabled={busy}
+            selectedFile={selectedFile}
+            onClear={() => {
+              setSelectedFile(null);
+              setError(null);
+            }}
+          />
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              disabled={busy || !selectedFile}
+              onClick={() => selectedFile && void runVerify(selectedFile)}
+              className="inline-flex items-center gap-2 rounded-md bg-zinc-900 px-4 py-2.5 text-sm font-medium text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {busy && (
+                <span
+                  className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent"
+                  aria-hidden
+                />
+              )}
+              {busy ? "Verifying…" : "Verify file"}
+            </button>
+            {!selectedFile && (
+              <span className="text-xs text-zinc-500">
+                Choose a file above to enable verification
+              </span>
+            )}
+          </div>
         </>
       )}
 
@@ -272,9 +331,17 @@ function VerifyInner() {
         </div>
       )}
 
-      {busy && (
-        <div className="rounded-md bg-sky-50 px-4 py-3 text-sm text-sky-800">
-          Verifying…
+      {busy && progress && (
+        <div
+          className="flex items-center gap-3 rounded-md border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900"
+          role="status"
+          aria-live="polite"
+        >
+          <span
+            className="inline-block h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-sky-600 border-t-transparent"
+            aria-hidden
+          />
+          <span>{progress}</span>
         </div>
       )}
 
