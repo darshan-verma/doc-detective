@@ -160,14 +160,15 @@ export function verifyTimeStampResponse(
   // Also accept imprint present but compare explicitly
   if (!imprintFound) {
     // Any 32-byte octet that is NOT the imprint → wrong imprint
-    let any32: Buffer | null = null;
+    // (holder object so TS tracks mutation inside the walk callback)
+    const found = { any32: null as Buffer | null };
     walk(root, (n) => {
       if (n instanceof asn1js.OctetString) {
         const buf = Buffer.from(n.valueBlock.valueHex);
-        if (buf.length === 32) any32 = buf;
+        if (buf.length === 32) found.any32 = buf;
       }
     });
-    if (any32 && !any32.equals(request.messageImprint)) {
+    if (found.any32 && !found.any32.equals(request.messageImprint)) {
       return { ok: false, reason: "messageImprint mismatch" };
     }
     return { ok: false, reason: "messageImprint not found" };
@@ -285,7 +286,7 @@ export async function defaultTsaClient(
       "Content-Type": "application/timestamp-query",
       Accept: "application/timestamp-reply",
     },
-    body: requestDer,
+    body: new Uint8Array(requestDer),
   });
   if (!res.ok) {
     throw new Error(`TSA HTTP ${res.status}: ${await res.text()}`);

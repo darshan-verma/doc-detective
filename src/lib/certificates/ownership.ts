@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "crypto";
+import type { Certificate } from "@prisma/client";
 import { prisma } from "../prisma";
 import { AppError } from "../errors";
 import { appendLogEntry, hashCertificateRecord } from "../trust";
@@ -62,14 +63,20 @@ export async function revokeCertificate(
 }
 
 /** Newest certificate in a lineage (follows supersededBy). */
-export async function findNewestVersion(certId: string) {
-  let current = await prisma.certificate.findUnique({ where: { certId } });
-  if (!current) return null;
+export async function findNewestVersion(
+  certId: string,
+): Promise<Certificate | null> {
+  const start = await prisma.certificate.findUnique({ where: { certId } });
+  if (!start) return null;
+
+  let current: Certificate = start;
   const seen = new Set<string>();
-  while (current.supersededBy && !seen.has(current.certId)) {
+  while (true) {
+    const supersededBy = current.supersededBy;
+    if (!supersededBy || seen.has(current.certId)) break;
     seen.add(current.certId);
     const next = await prisma.certificate.findUnique({
-      where: { certId: current.supersededBy },
+      where: { certId: supersededBy },
     });
     if (!next) break;
     current = next;

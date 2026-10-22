@@ -302,7 +302,9 @@ async function certifyImage(
   // Stamp FIRST when requested, then watermark + hash the stamped output
   let stamped = false;
   if (options.addVerificationStamp) {
-    inputBytes = await stampImage(inputBytes, certId, options.origin);
+    inputBytes = Buffer.from(
+      await stampImage(inputBytes, certId, options.origin),
+    );
     stamped = true;
   }
 
@@ -406,7 +408,7 @@ async function certifyGeneric(
     options.addVerificationStamp &&
     (mimeType === "application/pdf" || originalName.toLowerCase().endsWith(".pdf"))
   ) {
-    bytes = await stampPdf(bytes, certId, options.origin);
+    bytes = Buffer.from(await stampPdf(bytes, certId, options.origin));
     stamped = true;
   }
 

@@ -72,6 +72,7 @@ export async function decodeQrFromPdf(bytes: Buffer): Promise<string | null> {
   const ctx = canvas.getContext("2d");
   await page.render({
     canvasContext: ctx as unknown as CanvasRenderingContext2D,
+    canvas: canvas as unknown as HTMLCanvasElement,
     viewport,
   }).promise;
   const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
