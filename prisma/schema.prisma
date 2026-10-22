@@ -1,0 +1,113 @@
+// MongoDB Atlas via DATABASE_URL (mongodb+srv://…/dbname?…)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model Certificate {
+  id               String    @id @default(auto()) @map("_id") @db.ObjectId
+  certId           String    @unique
+  originalName     String
+  mimeType         String
+  sizeBytes        Int
+  /// Hash of the final stored bytes (after optional stamp/watermark).
+  sha256           String    @unique
+  /// Hash of the bytes as uploaded, before stamping or watermarking.
+  inputSha256      String?   @unique
+  /// 64-bit text SimHash hex for PDF/DOCX/TXT (nullable).
+  textSimhash      String?
+  /// When force-certified as a separate document resembling an earlier one.
+  similarToCertId  String?
+  storagePath      String
+  signature        String
+  signatureAlg     String    @default("ed25519")
+  keyId            String    @default("local-dev")
+  chunkHashes      String // JSON array of per-4KB SHA-256 hashes
+  // Image certification fields (null for non-image certificates)
+  width            Int?
+  height           Int?
+  imagePhash       String? // 64-bit hex
+  gridSize         Int       @default(32)
+  cellSignatures   String? // JSON array of per-cell { dHash, meanLuma }
+  watermarkBits    String? // JSON array of payload bits
+  watermarkVersion Int?
+  visibility       String    @default("LIMITED") // PUBLIC | LIMITED
+  timestampStatus  String    @default("PENDING") // PENDING | ANCHORED | FAILED
+  checkpointId     String?   @db.ObjectId
+  inclusionProof   String? // JSON Merkle inclusion proof
+  /// Ownership proof: only the hash is stored; raw token returned once at certify.
+  ownerTokenHash   String?
+  parentCertId     String?
+  version          Int       @default(1)
+  revokedAt        DateTime?
+  revokeReason     String?
+  supersededBy     String?
+  userId           String? // nullable — reserved for future auth
+  createdAt        DateTime  @default(now())
+
+  checkpoint Checkpoint? @relation(fields: [checkpointId], references: [id])
+
+  @@index([textSimhash])
+  @@index([similarToCertId])
+  @@index([imagePhash])
+  @@index([parentCertId])
+  @@index([ownerTokenHash])
+}
+
+model VerificationLog {
+  id             String   @id @default(auto()) @map("_id") @db.ObjectId
+  certId         String?
+  result         String // AUTHENTIC | TAMPERED | NOT_FOUND | MODIFIED_REENCODED | ...
+  uploadedSha256 String
+  reportSha256   String? // hash of a generated verification report PDF
+  createdAt      DateTime @default(now())
+}
+
+/// Append-only hash-chained transparency log. No update/delete paths in app code.
+model LogEntry {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  seq        Int      @unique
+  certId     String?
+  eventType  String // CERTIFICATE_CREATED | CERTIFICATE_REVOKED | KEY_ROTATION
+  recordHash String
+  prevHash   String
+  entryHash  String
+  /// Optional JSON metadata (e.g. { similarToCertId }).
+  details    String?
+  createdAt  DateTime @default(now())
+
+  @@index([certId])
+  @@index([createdAt])
+}
+
+model Checkpoint {
+  id                     String    @id @default(auto()) @map("_id") @db.ObjectId
+  fromSeq                Int
+  toSeq                  Int
+  merkleRoot             String
+  previousCheckpointHash String
+  tsaUrl                 String
+  timestampToken         Bytes // RFC 3161 TimeStampResp DER
+  genTime                DateTime?
+  createdAt              DateTime  @default(now())
+
+  certificates Certificate[]
+
+  @@index([fromSeq, toSeq])
+}
+
+/// Published signing keys. Never delete; rotation sets validTo on the old key.
+model PublicKeyRecord {
+  id        String    @id @default(auto()) @map("_id") @db.ObjectId
+  keyId     String    @unique
+  alg       String
+  publicKey String // SPKI PEM
+  validFrom DateTime
+  validTo   DateTime?
+  createdAt DateTime  @default(now())
+}
