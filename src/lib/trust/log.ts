@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
-import type { LogEntry, Prisma } from "@prisma/client";
+import type { LogEntry, LogHead, Prisma } from "@prisma/client";
 import { prisma } from "../prisma";
+import { LogHeadConflict, withTxRetry } from "./tx-retry";
 
 /** Fixed genesis prevHash for the first log entry. */
 export const GENESIS_PREV_HASH = createHash("sha256")
@@ -12,6 +13,9 @@ export const LOG_ENTRY_DOMAIN_V2 = "doc-detective/log/v2\n";
 
 /** Singleton document id for LogChainStatus. */
 export const LOG_CHAIN_STATUS_ID = "singleton";
+
+/** Singleton document id for LogHead. */
+export const LOG_HEAD_ID = "head";
 
 export type LogEventType =
   | "CERTIFICATE_CREATED"
@@ -454,15 +458,48 @@ export function revokeDisplayMessage(
   return "Revoked (reason could not be verified)";
 }
 
+function isUniqueViolation(err: unknown): boolean {
+  return Boolean(
+    err &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err as { code: string }).code === "P2002",
+  );
+}
+
+/**
+ * Read LogHead inside a transaction, creating it from the current max
+ * LogEntry (or genesis) when missing. Concurrent creates race on the same
+ * _id and surface as LogHeadConflict for outer retry.
+ */
+async function ensureLogHead(tx: Prisma.TransactionClient): Promise<LogHead> {
+  const existing = await tx.logHead.findUnique({ where: { id: LOG_HEAD_ID } });
+  if (existing) return existing;
+
+  const last = await tx.logEntry.findFirst({ orderBy: { seq: "desc" } });
+  try {
+    return await tx.logHead.create({
+      data: {
+        id: LOG_HEAD_ID,
+        seq: last?.seq ?? 0,
+        entryHash: last?.entryHash ?? GENESIS_PREV_HASH,
+      },
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      throw new LogHeadConflict("LogHead already initialised by concurrent writer");
+    }
+    throw err;
+  }
+}
+
 async function appendInside(
   tx: Prisma.TransactionClient,
   input: AppendLogInput,
 ): Promise<LogEntry> {
-  const last = await tx.logEntry.findFirst({
-    orderBy: { seq: "desc" },
-  });
-  const seq = (last?.seq ?? 0) + 1;
-  const prevHash = last?.entryHash ?? GENESIS_PREV_HASH;
+  const head = await ensureLogHead(tx);
+  const seq = head.seq + 1;
+  const prevHash = head.entryHash;
   const createdAt = input.createdAt ?? new Date();
   const certId = input.certId ?? null;
   const details = input.details ? JSON.stringify(input.details) : null;
@@ -477,6 +514,20 @@ async function appendInside(
     eventType: input.eventType,
     details,
   });
+
+  // Claim seq on the singleton head first so Mongo serialises concurrent
+  // writers on one document; losers CAS-miss / write-conflict and retry
+  // instead of colliding on LogEntry.seq create.
+  const cas = await tx.logHead.updateMany({
+    where: { id: LOG_HEAD_ID, seq: head.seq },
+    data: { seq, entryHash },
+  });
+  if (cas.count !== 1) {
+    throw new LogHeadConflict(
+      `LogHead CAS failed at seq ${head.seq} → ${seq}`,
+    );
+  }
+
   return tx.logEntry.create({
     data: {
       seq,
@@ -504,7 +555,9 @@ export async function appendLogEntry(
   if (client) {
     return appendInside(client, input);
   }
-  return prisma.$transaction((tx) => appendInside(tx, input));
+  return withTxRetry(() =>
+    prisma.$transaction((tx) => appendInside(tx, input)),
+  );
 }
 
 export interface ChainVerifyResult {

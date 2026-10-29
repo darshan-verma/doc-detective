@@ -24,6 +24,7 @@ import { decodeImage, encodePng } from "../src/lib/image";
 import type { PixelBuffer } from "../src/lib/image/pixels";
 import { resetSigningKeyCache } from "../src/lib/signing";
 import { getStorage, LocalDiskStorage, setStorage } from "../src/lib/storage";
+import { verifyLogChain } from "../src/lib/trust/log";
 
 const prisma = new PrismaClient();
 let storageDir: string;
@@ -48,6 +49,7 @@ beforeEach(async () => {
   await prisma.verificationLog.deleteMany();
   await prisma.certificate.deleteMany();
   await prisma.logEntry.deleteMany();
+  await prisma.logHead.deleteMany();
   await prisma.checkpoint.deleteMany();
   await prisma.publicKeyRecord.deleteMany();
 });
@@ -316,8 +318,34 @@ describe("identify + certify recognition", () => {
     const already = results.filter((r) => r.status === "ALREADY_CERTIFIED");
     expect(created.length + already.length).toBe(2);
     expect(created.length).toBe(1);
+    expect(already.length).toBe(1);
     expect(await prisma.certificate.count()).toBe(1);
   });
+
+  it(
+    "20 concurrent certifies of different files all succeed with contiguous log seqs",
+    async () => {
+      const stamp = Date.now();
+      const results = await Promise.all(
+        Array.from({ length: 20 }, (_, i) =>
+          certifyUpload(makeFile(`concurrent-diff-${stamp}-${i}`, `d${i}.txt`)),
+        ),
+      );
+      expect(results.every((r) => r.status === "CREATED")).toBe(true);
+      expect(await prisma.certificate.count()).toBe(20);
+
+      const entries = await prisma.logEntry.findMany({ orderBy: { seq: "asc" } });
+      expect(entries.map((e) => e.seq)).toEqual(
+        Array.from({ length: 20 }, (_, i) => i + 1),
+      );
+      const seqs = entries.map((e) => e.seq);
+      expect(new Set(seqs).size).toBe(20);
+
+      const chain = await verifyLogChain();
+      expect(chain.ok).toBe(true);
+    },
+    60_000,
+  );
 
   it("revoked match returns ALREADY_CERTIFIED_REVOKED and creates nothing", async () => {
     const a = await certifyUpload(makeFile("to-revoke", "r.txt"));

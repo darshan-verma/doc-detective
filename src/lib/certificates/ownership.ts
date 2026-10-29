@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "crypto";
 import type { Certificate } from "@prisma/client";
 import { prisma } from "../prisma";
 import { AppError } from "../errors";
-import { appendLogEntry, hashRevokeRecord } from "../trust";
+import { appendLogEntry, hashRevokeRecord, withTxRetry } from "../trust";
 
 export function hashOwnerToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
@@ -39,29 +39,34 @@ export async function revokeCertificate(
   }
   const revokedAt = new Date();
   const reasonTrimmed = reason.slice(0, 500);
-  await prisma.$transaction(async (tx) => {
-    await tx.certificate.update({
-      where: { certId },
-      data: { revokedAt, revokeReason: reasonTrimmed },
-    });
-    await appendLogEntry(
-      {
-        certId,
-        eventType: "CERTIFICATE_REVOKED",
-        recordHash: hashRevokeRecord({
-          certId: cert.certId,
-          revokedAt,
-          reason: reasonTrimmed,
-        }),
-        createdAt: revokedAt,
-        details: {
-          revokedAt: revokedAt.toISOString(),
-          reason: reasonTrimmed,
-        },
-      },
-      tx,
-    );
+  const recordHash = hashRevokeRecord({
+    certId: cert.certId,
+    revokedAt,
+    reason: reasonTrimmed,
   });
+  await withTxRetry(
+    () =>
+      prisma.$transaction(async (tx) => {
+        await tx.certificate.update({
+          where: { certId },
+          data: { revokedAt, revokeReason: reasonTrimmed },
+        });
+        await appendLogEntry(
+          {
+            certId,
+            eventType: "CERTIFICATE_REVOKED",
+            recordHash,
+            createdAt: revokedAt,
+            details: {
+              revokedAt: revokedAt.toISOString(),
+              reason: reasonTrimmed,
+            },
+          },
+          tx,
+        );
+      }),
+    { attempts: 32, baseMs: 20, jitter: true },
+  );
 }
 
 /** Newest certificate in a lineage (follows supersededBy). */

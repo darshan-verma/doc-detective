@@ -44,6 +44,7 @@ import {
   normalizeCertId,
   syncPublicKeysToDb,
   watermarkTokenFromCertId,
+  withTxRetry,
 } from "../trust";
 import { assertOwnerToken, issueOwnerToken } from "./ownership";
 import { publicCertificateView } from "./public-view";
@@ -194,87 +195,88 @@ async function persistCertificate(args: {
   });
 
   try {
-    return await prisma.$transaction(async (tx) => {
-      // Re-check exact match inside the transaction to close the race window.
-      const raced =
-        (await tx.certificate.findFirst({
-          where: {
-            OR: [
-              { sha256: args.inputSha256 },
-              { inputSha256: args.inputSha256 },
-              { sha256: args.sha256 },
-            ],
+    // Signature is independent of log seq — sign once, retry only the write.
+    // attempts > burst concurrency so OCC waves can drain (e.g. 20-way certify).
+    return await withTxRetry(
+      () =>
+      prisma.$transaction(async (tx) => {
+        // Re-check exact match inside the transaction to close the race window.
+        const raced =
+          (await tx.certificate.findFirst({
+            where: {
+              OR: [
+                { sha256: args.inputSha256 },
+                { inputSha256: args.inputSha256 },
+                { sha256: args.sha256 },
+              ],
+            },
+          })) ?? null;
+        if (raced) {
+          throw new ExactMatchRace(raced);
+        }
+
+        const cert = await tx.certificate.create({
+          data: {
+            certId: args.certId,
+            originalName: args.originalName,
+            mimeType: args.mimeType,
+            sizeBytes: args.sizeBytes,
+            sha256: args.sha256,
+            inputSha256: args.inputSha256,
+            textSimhash: args.textSimhash ?? null,
+            similarToCertId: args.similarToCertId ?? null,
+            storagePath: args.storagePath,
+            signature: signed.signature,
+            signatureAlg: signed.alg,
+            keyId: signed.keyId,
+            signatureVersion: 2,
+            chunkHashes: JSON.stringify(args.chunkHashes),
+            visibility: args.visibility ?? "LIMITED",
+            timestampStatus: "PENDING",
+            ownerTokenHash: args.ownerTokenHash,
+            parentCertId: args.parentCertId ?? null,
+            version,
+            width: args.width,
+            height: args.height,
+            imagePhash: args.imagePhash,
+            gridSize,
+            cellSignatures: cellSignaturesJson,
+            watermarkBits: watermarkBitsJson,
+            watermarkVersion: args.watermarkVersion,
+            createdAt: args.createdAt,
           },
-        })) ?? null;
-      if (raced) {
-        throw new ExactMatchRace(raced);
-      }
-
-      const cert = await tx.certificate.create({
-        data: {
-          certId: args.certId,
-          originalName: args.originalName,
-          mimeType: args.mimeType,
-          sizeBytes: args.sizeBytes,
-          sha256: args.sha256,
-          inputSha256: args.inputSha256,
-          textSimhash: args.textSimhash ?? null,
-          similarToCertId: args.similarToCertId ?? null,
-          storagePath: args.storagePath,
-          signature: signed.signature,
-          signatureAlg: signed.alg,
-          keyId: signed.keyId,
-          signatureVersion: 2,
-          chunkHashes: JSON.stringify(args.chunkHashes),
-          visibility: args.visibility ?? "LIMITED",
-          timestampStatus: "PENDING",
-          ownerTokenHash: args.ownerTokenHash,
-          parentCertId: args.parentCertId ?? null,
-          version,
-          width: args.width,
-          height: args.height,
-          imagePhash: args.imagePhash,
-          gridSize,
-          cellSignatures: cellSignaturesJson,
-          watermarkBits: watermarkBitsJson,
-          watermarkVersion: args.watermarkVersion,
-          createdAt: args.createdAt,
-        },
-      });
-
-      if (args.parentCertId) {
-        await tx.certificate.update({
-          where: { certId: args.parentCertId },
-          data: { supersededBy: args.certId },
         });
-      }
 
-      await appendLogEntry(
-        {
-          certId: args.certId,
-          eventType: "CERTIFICATE_CREATED",
-          recordHash,
-          createdAt: args.createdAt,
-          details: args.similarToCertId
-            ? { similarToCertId: args.similarToCertId }
-            : null,
-        },
-        tx,
-      );
+        if (args.parentCertId) {
+          await tx.certificate.update({
+            where: { certId: args.parentCertId },
+            data: { supersededBy: args.certId },
+          });
+        }
 
-      return cert;
-    });
+        await appendLogEntry(
+          {
+            certId: args.certId,
+            eventType: "CERTIFICATE_CREATED",
+            recordHash,
+            createdAt: args.createdAt,
+            details: args.similarToCertId
+              ? { similarToCertId: args.similarToCertId }
+              : null,
+          },
+          tx,
+        );
+
+        return cert;
+      }),
+      { attempts: 32, baseMs: 20, jitter: true },
+    );
   } catch (err) {
     if (err instanceof ExactMatchRace) {
       throw err;
     }
-    // Unique constraint race on sha256 / inputSha256
-    if (
-      err &&
-      typeof err === "object" &&
-      "code" in err &&
-      (err as { code: string }).code === "P2002"
-    ) {
+    // Only map file-hash unique races — never LogEntry.seq P2002.
+    if (isExactMatchUniqueViolation(err)) {
       const existing = await prisma.certificate.findFirst({
         where: {
           OR: [
@@ -289,6 +291,29 @@ async function persistCertificate(args: {
     }
     throw err;
   }
+}
+
+/** P2002 on Certificate.sha256 / inputSha256 (duplicate-file race). */
+function isExactMatchUniqueViolation(err: unknown): boolean {
+  if (
+    !err ||
+    typeof err !== "object" ||
+    !("code" in err) ||
+    (err as { code: string }).code !== "P2002"
+  ) {
+    return false;
+  }
+  const meta = (err as { meta?: { target?: string | string[] } }).meta;
+  const target = meta?.target;
+  const targets = Array.isArray(target)
+    ? target.map(String)
+    : target
+      ? [String(target)]
+      : [];
+  return targets.some((t) => {
+    const last = t.split(".").pop() ?? t;
+    return last === "sha256" || last === "inputSha256";
+  });
 }
 
 /** Thrown when a concurrent insert loses the race to an identical file. */

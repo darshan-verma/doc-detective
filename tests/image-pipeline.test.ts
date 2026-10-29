@@ -49,6 +49,7 @@ beforeEach(async () => {
   await prisma.verificationLog.deleteMany();
   await prisma.certificate.deleteMany();
   await prisma.logEntry.deleteMany();
+  await prisma.logHead.deleteMany();
   await prisma.checkpoint.deleteMany();
   await prisma.publicKeyRecord.deleteMany();
 });

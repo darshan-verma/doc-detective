@@ -40,6 +40,7 @@ export {
   GENESIS_PREV_HASH,
   LOG_ENTRY_DOMAIN_V2,
   LOG_CHAIN_STATUS_ID,
+  LOG_HEAD_ID,
 } from "./log";
 export type {
   LogEventType,
@@ -48,6 +49,14 @@ export type {
   EntryIntegrity,
   LogIntegrity,
 } from "./log";
+
+export {
+  LogHeadConflict,
+  withTxRetry,
+  isRetryableTxError,
+  isLogEntrySeqUniqueViolation,
+} from "./tx-retry";
+export type { WithTxRetryOptions } from "./tx-retry";
 
 export {
   buildMerkleTree,

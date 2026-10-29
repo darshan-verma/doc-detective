@@ -90,6 +90,15 @@ model LogEntry {
   @@index([createdAt])
 }
 
+/// Singleton head of the transparency log. Concurrent appends CAS this document
+/// so Mongo serialises writers (avoids forked seq / WriteConflict storms).
+model LogHead {
+  id        String   @id @map("_id") // always "head"
+  seq       Int
+  entryHash String
+  updatedAt DateTime @updatedAt
+}
+
 /// Latest full-chain verification result (upserted by checkpoint cron).
 model LogChainStatus {
   id          String   @id @map("_id")
