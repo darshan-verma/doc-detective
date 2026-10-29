@@ -26,6 +26,7 @@ import { parseCertIdFromFilename } from "../filenames";
 import {
   aspectDiffers,
   cellSignatures,
+  classifyImageChange,
   compareCells,
   decodeImage,
   extract,
@@ -33,6 +34,8 @@ import {
   phash64,
   resizePixels,
   type CellSignature,
+  type ChangedCellCluster,
+  type ImageChangeClass,
 } from "../image";
 import { prisma } from "../prisma";
 
@@ -66,6 +69,12 @@ export interface ImageVerifyAnalysis {
   height: number;
   matchedBy?: MatchedBy;
   reason?: string;
+  /** Localized classifier label from classifyImageChange(). */
+  changeClass?: ImageChangeClass;
+  maxCellScore?: number;
+  largestCluster?: Pick<ChangedCellCluster, "size" | "score"> & {
+    cells?: Array<{ x: number; y: number }>;
+  };
 }
 
 export interface VerifyResponse {
@@ -225,6 +234,15 @@ async function verifyImageAgainstCert(
     }
   }
 
+  const classified = classifyImageChange(comparison, {
+    tamperScoreAlert: config.tamperScoreAlert,
+    cellStrongHamming: config.cellStrongHamming,
+    cellStrongLuma: config.cellStrongLuma,
+    tamperMinClusterCells: config.tamperMinClusterCells,
+    globalChangeMinPercent: config.globalChangeMinPercent,
+  });
+
+  const largest = comparison.clusters[0];
   const analysis: ImageVerifyAnalysis = {
     ...baseAnalysis,
     visualDistance: comparison.visualDistance,
@@ -235,13 +253,28 @@ async function verifyImageAgainstCert(
     gridSize: comparison.gridSize,
     width: comparePixels.width,
     height: comparePixels.height,
+    reason: classified.reason,
+    changeClass: classified.classification,
+    maxCellScore: comparison.maxCellScore,
+    largestCluster: largest
+      ? { size: largest.size, score: largest.score, cells: largest.cells }
+      : undefined,
   };
 
-  const notTampered =
-    comparison.changedPercent === 0 ||
-    comparison.tamperScore < config.tamperScoreAlert;
+  if (classified.classification === "TAMPERED") {
+    await logVerification(cert.certId, "TAMPERED", uploadedSha256);
+    return {
+      result: "TAMPERED",
+      uploadedSha256,
+      certId: cert.certId,
+      certificate: publicCertificateView(cert),
+      signatureValid,
+      message: `Image has been tampered with. ${comparison.changedCells.length} cell(s) differ (${comparison.changedPercent.toFixed(1)}% of grid). ${classified.reason}`,
+      imageAnalysis: analysis,
+    };
+  }
 
-  if (notTampered) {
+  if (classified.classification === "GLOBAL_ADJUSTMENT") {
     await logVerification(cert.certId, "MODIFIED_REENCODED", uploadedSha256);
     return {
       result: "MODIFIED_REENCODED",
@@ -250,19 +283,21 @@ async function verifyImageAgainstCert(
       certificate: publicCertificateView(cert),
       signatureValid,
       message:
-        "Image matches the certified visual content (re-encoded or lightly processed). Not considered tampered.",
+        "Whole-image adjustment detected (brightness/contrast/filter). Not considered content tampering.",
       imageAnalysis: analysis,
     };
   }
 
-  await logVerification(cert.certId, "TAMPERED", uploadedSha256);
+  // UNCHANGED | REENCODED
+  await logVerification(cert.certId, "MODIFIED_REENCODED", uploadedSha256);
   return {
-    result: "TAMPERED",
+    result: "MODIFIED_REENCODED",
     uploadedSha256,
     certId: cert.certId,
     certificate: publicCertificateView(cert),
     signatureValid,
-    message: `Image has been tampered with. ${comparison.changedCells.length} cell(s) differ (${comparison.changedPercent.toFixed(1)}% of grid).`,
+    message:
+      "Image matches the certified visual content (re-encoded or lightly processed). Not considered tampered.",
     imageAnalysis: analysis,
   };
 }

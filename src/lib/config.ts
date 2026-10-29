@@ -24,6 +24,19 @@ const envSchema = z.object({
   CELL_HAMMING_THRESHOLD: z.coerce.number().int().positive().default(12),
   /** Cell mean-luminance delta threshold (0–255) */
   CELL_LUMA_DELTA_THRESHOLD: z.coerce.number().positive().default(18),
+  /**
+   * Single-cell Hamming above this → localized TAMPERED.
+   * Default 48 (not 20): uniform brightness clamping and 50% down/up resize
+   * routinely produce per-cell ham 24–40 on textured pages; those must reach
+   * GLOBAL_ADJUSTMENT. Localized block edits still trip cluster size ≥ 2.
+   */
+  CELL_STRONG_HAMMING: z.coerce.number().int().positive().default(48),
+  /** Single-cell luma delta above this → localized TAMPERED */
+  CELL_STRONG_LUMA: z.coerce.number().positive().default(40),
+  /** Connected changed-cell cluster size that counts as tamper */
+  TAMPER_MIN_CLUSTER_CELLS: z.coerce.number().int().positive().default(2),
+  /** % of grid changed above this + consistent luma → GLOBAL_ADJUSTMENT */
+  GLOBAL_CHANGE_MIN_PERCENT: z.coerce.number().positive().default(60),
   /** Default grid size for cell signatures */
   IMAGE_GRID_SIZE: z.coerce.number().int().positive().default(32),
   /** QIM quantization step for watermark embedding */
@@ -49,6 +62,10 @@ function loadConfig() {
     TAMPER_SCORE_ALERT: process.env.TAMPER_SCORE_ALERT ?? 1.5,
     CELL_HAMMING_THRESHOLD: process.env.CELL_HAMMING_THRESHOLD ?? 12,
     CELL_LUMA_DELTA_THRESHOLD: process.env.CELL_LUMA_DELTA_THRESHOLD ?? 18,
+    CELL_STRONG_HAMMING: process.env.CELL_STRONG_HAMMING ?? 20,
+    CELL_STRONG_LUMA: process.env.CELL_STRONG_LUMA ?? 40,
+    TAMPER_MIN_CLUSTER_CELLS: process.env.TAMPER_MIN_CLUSTER_CELLS ?? 2,
+    GLOBAL_CHANGE_MIN_PERCENT: process.env.GLOBAL_CHANGE_MIN_PERCENT ?? 60,
     IMAGE_GRID_SIZE: process.env.IMAGE_GRID_SIZE ?? 32,
     WATERMARK_QIM_STEP: process.env.WATERMARK_QIM_STEP ?? 24,
   });
@@ -76,6 +93,10 @@ function loadConfig() {
     tamperScoreAlert: parsed.data.TAMPER_SCORE_ALERT,
     cellHammingThreshold: parsed.data.CELL_HAMMING_THRESHOLD,
     cellLumaDeltaThreshold: parsed.data.CELL_LUMA_DELTA_THRESHOLD,
+    cellStrongHamming: parsed.data.CELL_STRONG_HAMMING,
+    cellStrongLuma: parsed.data.CELL_STRONG_LUMA,
+    tamperMinClusterCells: parsed.data.TAMPER_MIN_CLUSTER_CELLS,
+    globalChangeMinPercent: parsed.data.GLOBAL_CHANGE_MIN_PERCENT,
     imageGridSize: parsed.data.IMAGE_GRID_SIZE,
     watermarkQimStep: parsed.data.WATERMARK_QIM_STEP,
   };

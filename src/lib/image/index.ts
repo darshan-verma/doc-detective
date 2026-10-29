@@ -12,8 +12,14 @@ export {
   hamming,
   cellSignatures,
   compareCells,
+  classifyImageChange,
   type CellSignature,
   type CellCompareResult,
+  type ChangedCellDetail,
+  type ChangedCellCluster,
+  type ImageChangeClass,
+  type ClassifyImageChangeConfig,
+  type ClassifyImageChangeResult,
 } from "./fingerprint";
 export {
   embed,

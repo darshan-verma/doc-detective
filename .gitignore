@@ -81,3 +81,4 @@ plan.md
 *.tmp
 .cache/
 .env*.local
+*.md
