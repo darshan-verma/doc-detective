@@ -8,6 +8,16 @@ export {
   aspectRatio,
 } from "./codec";
 export {
+  detectBufferFormat,
+  extractImagePixelsFromPdf,
+  formatDisplayName,
+  isPdfBuffer,
+  isSharpDecodableImageFormat,
+  PDF_IMAGE_UNAVAILABLE_MESSAGE,
+  type BufferFormat,
+  type PdfImageExtractResult,
+} from "./from-pdf";
+export {
   phash64,
   hamming,
   cellSignatures,

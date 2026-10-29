@@ -19,12 +19,33 @@ export interface PlainLanguageResult {
   }>;
   whatWeCouldNotCheck: string[];
   formatDifferences: AnalysisChange[];
-  /** Fixed disclaimer — never imply original contents are true. */
+  /**
+   * Verdict-specific disclaimer. Empty for TAMPERED / ANALYSIS_UNAVAILABLE /
+   * REVOKED / NOT_FOUND — never claim the file is "unchanged" there.
+   */
   disclaimer: string;
 }
 
-const DISCLAIMER =
+const DISCLAIMER_AUTHENTIC =
   "This confirms the file is unchanged since it was certified, not that its original contents are true.";
+
+const DISCLAIMER_MODIFIED =
+  "The visible content matches the certified file; the file itself has been re-saved.";
+
+function disclaimerFor(
+  verdict: Verdict,
+  options?: { revoked?: boolean },
+): string {
+  if (options?.revoked) return "";
+  switch (verdict) {
+    case Verdict.AUTHENTIC:
+      return DISCLAIMER_AUTHENTIC;
+    case Verdict.MODIFIED_FORMAT_ONLY:
+      return DISCLAIMER_MODIFIED;
+    default:
+      return "";
+  }
+}
 
 const CONFIDENCE_LABEL: Record<Confidence, "High" | "Medium" | "Low"> = {
   HIGH: "High",
@@ -69,7 +90,7 @@ export function explainAnalysis(
       whatWeChecked: mapChecks(analysis.checks),
       whatWeCouldNotCheck: analysis.notChecked,
       formatDifferences,
-      disclaimer: DISCLAIMER,
+      disclaimer: disclaimerFor(analysis.verdict, { revoked: true }),
     };
   }
 
@@ -83,7 +104,7 @@ export function explainAnalysis(
     whatWeChecked: mapChecks(analysis.checks),
     whatWeCouldNotCheck: [...analysis.notChecked],
     formatDifferences,
-    disclaimer: DISCLAIMER,
+    disclaimer: disclaimerFor(analysis.verdict),
   };
 }
 

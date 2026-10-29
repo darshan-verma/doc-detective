@@ -18,6 +18,7 @@ import {
   analyzePair,
   Verdict,
   type AnalysisResult,
+  type CheckResult,
 } from "../analysis";
 import { getConfig } from "../config";
 import { diffFiles, type DiffResult } from "../diff";
@@ -38,15 +39,22 @@ import {
   classifyImageChange,
   compareCells,
   decodeImage,
+  detectBufferFormat,
   detectLocalizedPixelTamper,
   extract,
+  extractImagePixelsFromPdf,
+  formatDisplayName,
   isCertifiableImage,
+  isPdfBuffer,
+  isSharpDecodableImageFormat,
+  PDF_IMAGE_UNAVAILABLE_MESSAGE,
   phash64,
   resizePixels,
   type CellSignature,
   type ChangedCellCluster,
   type ImageChangeClass,
   type LocalizedRegion,
+  type PixelBuffer,
 } from "../image";
 import { prisma } from "../prisma";
 
@@ -215,32 +223,82 @@ function parseCellSignatures(cert: Certificate): CellSignature[] | null {
   }
 }
 
-async function verifyImageAgainstCert(
+function analysisFromImageVerdict(
+  result: VerifyResultType,
+  checks: CheckResult[],
+  detail?: string,
+): AnalysisResult {
+  const verdict =
+    result === "AUTHENTIC"
+      ? Verdict.AUTHENTIC
+      : result === "MODIFIED_REENCODED" || result === "MODIFIED_FORMAT_ONLY"
+        ? Verdict.MODIFIED_FORMAT_ONLY
+        : result === "ANALYSIS_UNAVAILABLE"
+          ? Verdict.ANALYSIS_UNAVAILABLE
+          : Verdict.TAMPERED;
+  return {
+    verdict,
+    confidence:
+      result === "ANALYSIS_UNAVAILABLE"
+        ? "LOW"
+        : result === "MODIFIED_REENCODED"
+          ? "MEDIUM"
+          : "HIGH",
+    checks,
+    changes: detail
+      ? [{ description: detail, kind: "image" }]
+      : [],
+    notChecked: [],
+  };
+}
+
+function withImageAnalysisPayload(
+  response: Omit<VerifyResponse, "analysis" | "explanation">,
+  extraChecks: CheckResult[],
+  detail?: string,
+): VerifyResponse {
+  if (extraChecks.length === 0 && response.result !== "ANALYSIS_UNAVAILABLE") {
+    return response;
+  }
+  const checks: CheckResult[] =
+    extraChecks.length > 0
+      ? extraChecks
+      : response.analysis?.checks ?? [
+          {
+            name: "image-content",
+            status:
+              response.result === "TAMPERED"
+                ? "FAILED"
+                : response.result === "ANALYSIS_UNAVAILABLE"
+                  ? "NOT_CHECKED"
+                  : "PASSED",
+            detail,
+          },
+        ];
+  const analysis = analysisFromImageVerdict(response.result, checks, detail);
+  return {
+    ...response,
+    analysis,
+    explanation: explainAnalysis(analysis, {
+      revoked: response.result === "REVOKED",
+    }),
+  };
+}
+
+/**
+ * Verify an image certificate against already-decoded (or PDF-extracted) pixels.
+ */
+async function verifyImagePixelsAgainstCert(
   cert: Certificate,
-  uploadedBytes: Buffer,
+  uploadedPixels: PixelBuffer,
   uploadedSha256: string,
   matchedBy: MatchedBy,
   watermarkInfo: { found: boolean; confidence: number },
+  signatureValid: boolean,
+  revocation: RevocationLogCheck,
+  extraChecks: CheckResult[] = [],
 ): Promise<VerifyResponse> {
   const config = getConfig();
-  const signatureValid = await checkRecordSignature(cert);
-  if (!signatureValid) {
-    await logVerification(cert.certId, "TAMPERED", uploadedSha256);
-    return finalizeVerifyResponse(signatureInvalidResponse(cert, uploadedSha256));
-  }
-
-  const revocation = await checkCertificateRevocation(cert);
-
-  let uploadedPixels;
-  try {
-    uploadedPixels = await decodeImage(uploadedBytes);
-  } catch (err) {
-    throw new AppError(
-      "BAD_REQUEST",
-      `Uploaded file could not be decoded as an image${err instanceof Error ? `: ${err.message}` : ""}`,
-      400,
-    );
-  }
 
   const origW = cert.width ?? uploadedPixels.width;
   const origH = cert.height ?? uploadedPixels.height;
@@ -258,10 +316,19 @@ async function verifyImageAgainstCert(
     matchedBy,
   };
 
+  const wrap = (
+    response: Omit<VerifyResponse, "analysis" | "explanation">,
+    detail?: string,
+  ) =>
+    finalizeVerifyResponse(
+      withImageAnalysisPayload(response, extraChecks, detail),
+      revocation,
+    );
+
   // Aspect ratio differs → TAMPERED, skip cell comparison
   if (aspectDiffers(origW, origH, uploadedPixels.width, uploadedPixels.height)) {
     await logVerification(cert.certId, "TAMPERED", uploadedSha256);
-    return finalizeVerifyResponse(
+    return wrap(
       {
         result: "TAMPERED",
         uploadedSha256,
@@ -276,7 +343,7 @@ async function verifyImageAgainstCert(
           reason: "dimensions differ",
         },
       },
-      revocation,
+      "dimensions differ",
     );
   }
 
@@ -294,8 +361,7 @@ async function verifyImageAgainstCert(
   const uploadCells = cellSignatures(comparePixels, gridSize);
 
   let comparison;
-  let storedPixelsForPixelStage: Awaited<ReturnType<typeof decodeImage>> | null =
-    null;
+  let storedPixelsForPixelStage: PixelBuffer | null = null;
   if (origCells && origCells.length === gridSize * gridSize) {
     comparison = compareCells(origCells, uploadCells, gridSize, {
       hammingThreshold: config.cellHammingThreshold,
@@ -328,6 +394,7 @@ async function verifyImageAgainstCert(
         verdict: Verdict.ANALYSIS_UNAVAILABLE,
         confidence: "LOW",
         checks: [
+          ...extraChecks,
           {
             name: "image-cells",
             status: "NOT_CHECKED",
@@ -371,7 +438,7 @@ async function verifyImageAgainstCert(
   });
 
   const largest = comparison.clusters[0];
-  const analysis: ImageVerifyAnalysis = {
+  const imageAnalysis: ImageVerifyAnalysis = {
     ...baseAnalysis,
     visualDistance: comparison.visualDistance,
     tamperScore: comparison.tamperScore,
@@ -417,17 +484,17 @@ async function verifyImageAgainstCert(
           outlierK: config.outlierK,
         },
       );
-      analysis.pixelStageUsed = true;
+      imageAnalysis.pixelStageUsed = true;
       if (pixel.tampered) {
         classified = {
           classification: "TAMPERED",
           reason: pixel.reason,
         };
-        analysis.changeClass = "TAMPERED";
-        analysis.reason = pixel.reason;
-        analysis.localizedRegions = pixel.regions;
+        imageAnalysis.changeClass = "TAMPERED";
+        imageAnalysis.reason = pixel.reason;
+        imageAnalysis.localizedRegions = pixel.regions;
       } else {
-        analysis.reason = `${classified.reason}; ${pixel.reason}`;
+        imageAnalysis.reason = `${classified.reason}; ${pixel.reason}`;
       }
     } catch (err) {
       if (err instanceof AppError && err.code === "STORED_FILE_INTEGRITY") {
@@ -438,34 +505,31 @@ async function verifyImageAgainstCert(
         );
       }
       console.error("[verifyImageAgainstCert] pixel stage failed", err);
-      analysis.reason = `${classified.reason}; pixel stage unavailable (stored file unreadable)`;
+      imageAnalysis.reason = `${classified.reason}; pixel stage unavailable (stored file unreadable)`;
     }
   }
 
   if (revocation.revoked) {
     await logVerification(cert.certId, "REVOKED", uploadedSha256);
     const revokeNote = revokeDisplayMessage(revocation, cert.revokeReason);
-    return finalizeVerifyResponse(
-      {
-        result: "REVOKED",
-        uploadedSha256,
-        certId: cert.certId,
-        certificate: publicCertificateView(cert),
-        signatureValid,
-        legacyRecord: legacyFlag(cert),
-        detailsVerified: revocation.detailsVerified,
-        message: revocation.detailsVerified
-          ? "Certificate has been revoked. Do not treat this file as currently certified."
-          : `${revokeNote}. Do not treat this file as currently certified.`,
-        imageAnalysis: analysis,
-      },
-      revocation,
-    );
+    return wrap({
+      result: "REVOKED",
+      uploadedSha256,
+      certId: cert.certId,
+      certificate: publicCertificateView(cert),
+      signatureValid,
+      legacyRecord: legacyFlag(cert),
+      detailsVerified: revocation.detailsVerified,
+      message: revocation.detailsVerified
+        ? "Certificate has been revoked. Do not treat this file as currently certified."
+        : `${revokeNote}. Do not treat this file as currently certified.`,
+      imageAnalysis,
+    });
   }
 
   if (classified.classification === "TAMPERED") {
     await logVerification(cert.certId, "TAMPERED", uploadedSha256);
-    return finalizeVerifyResponse(
+    return wrap(
       {
         result: "TAMPERED",
         uploadedSha256,
@@ -474,34 +538,15 @@ async function verifyImageAgainstCert(
         signatureValid,
         legacyRecord: legacyFlag(cert),
         message: `Image has been tampered with. ${comparison.changedCells.length} cell(s) differ (${comparison.changedPercent.toFixed(1)}% of grid). ${classified.reason}`,
-        imageAnalysis: analysis,
+        imageAnalysis,
       },
-      revocation,
+      classified.reason,
     );
   }
 
   if (classified.classification === "GLOBAL_ADJUSTMENT") {
     await logVerification(cert.certId, "MODIFIED_REENCODED", uploadedSha256);
-    return finalizeVerifyResponse(
-      {
-        result: "MODIFIED_REENCODED",
-        uploadedSha256,
-        certId: cert.certId,
-        certificate: publicCertificateView(cert),
-        signatureValid,
-        legacyRecord: legacyFlag(cert),
-        message:
-          "Whole-image adjustment detected (brightness/contrast/filter). Not considered content tampering.",
-        imageAnalysis: analysis,
-      },
-      revocation,
-    );
-  }
-
-  // UNCHANGED | REENCODED
-  await logVerification(cert.certId, "MODIFIED_REENCODED", uploadedSha256);
-  return finalizeVerifyResponse(
-    {
+    return wrap({
       result: "MODIFIED_REENCODED",
       uploadedSha256,
       certId: cert.certId,
@@ -509,9 +554,216 @@ async function verifyImageAgainstCert(
       signatureValid,
       legacyRecord: legacyFlag(cert),
       message:
-        "Image matches the certified visual content (re-encoded or lightly processed). Not considered tampered.",
-      imageAnalysis: analysis,
-    },
+        "Whole-image adjustment detected (brightness/contrast/filter). Not considered content tampering.",
+      imageAnalysis,
+    });
+  }
+
+  // UNCHANGED | REENCODED
+  await logVerification(cert.certId, "MODIFIED_REENCODED", uploadedSha256);
+  return wrap({
+    result: "MODIFIED_REENCODED",
+    uploadedSha256,
+    certId: cert.certId,
+    certificate: publicCertificateView(cert),
+    signatureValid,
+    legacyRecord: legacyFlag(cert),
+    message:
+      "Image matches the certified visual content (re-encoded or lightly processed). Not considered tampered.",
+    imageAnalysis,
+  });
+}
+
+/**
+ * Resolve upload bytes (including PDF wrappers / unsupported formats) then
+ * verify against an image certificate. Never falls through to binary diff.
+ */
+async function verifyImageAgainstCert(
+  cert: Certificate,
+  uploadedBytes: Buffer,
+  uploadedSha256: string,
+  matchedBy: MatchedBy,
+  watermarkInfo: { found: boolean; confidence: number },
+): Promise<VerifyResponse> {
+  const signatureValid = await checkRecordSignature(cert);
+  if (!signatureValid) {
+    await logVerification(cert.certId, "TAMPERED", uploadedSha256);
+    return finalizeVerifyResponse(signatureInvalidResponse(cert, uploadedSha256));
+  }
+
+  const revocation = await checkCertificateRevocation(cert);
+
+  if (isPdfBuffer(uploadedBytes)) {
+    const extracted = await extractImagePixelsFromPdf(uploadedBytes, {
+      width: cert.width,
+      height: cert.height,
+    });
+    if (!extracted.ok) {
+      const analysis: AnalysisResult = {
+        verdict: Verdict.ANALYSIS_UNAVAILABLE,
+        confidence: "LOW",
+        checks: [
+          {
+            name: "format-conversion",
+            status: "FAILED",
+            detail: PDF_IMAGE_UNAVAILABLE_MESSAGE,
+          },
+        ],
+        changes: [],
+        notChecked: ["image-content"],
+      };
+      await logVerification(cert.certId, "ANALYSIS_UNAVAILABLE", uploadedSha256);
+      return finalizeVerifyResponse(
+        {
+          result: "ANALYSIS_UNAVAILABLE",
+          uploadedSha256,
+          certId: cert.certId,
+          certificate: publicCertificateView(cert),
+          analysis,
+          explanation: explainAnalysis(analysis),
+          signatureValid,
+          legacyRecord: legacyFlag(cert),
+          message: PDF_IMAGE_UNAVAILABLE_MESSAGE,
+          imageAnalysis: {
+            watermark: watermarkInfo,
+            visualDistance: 0,
+            tamperScore: 0,
+            changedPercent: 0,
+            changedRegions: 0,
+            changedCells: [],
+            gridSize: cert.gridSize || getConfig().imageGridSize,
+            width: cert.width ?? 0,
+            height: cert.height ?? 0,
+            matchedBy,
+            reason: extracted.reason,
+          },
+        },
+        revocation,
+      );
+    }
+
+    return verifyImagePixelsAgainstCert(
+      cert,
+      extracted.pixels,
+      uploadedSha256,
+      matchedBy,
+      watermarkInfo,
+      signatureValid,
+      revocation,
+      [
+        {
+          name: "format-conversion",
+          status: "PASSED",
+          detail: "Uploaded as PDF; compared the image embedded in the PDF",
+        },
+      ],
+    );
+  }
+
+  const format = detectBufferFormat(uploadedBytes);
+  if (format !== "unknown" && !isSharpDecodableImageFormat(format)) {
+    const label = formatDisplayName(format);
+    const message = `Unsupported image format (${label}). Convert to PNG, JPEG, or WebP and try again.`;
+    const analysis: AnalysisResult = {
+      verdict: Verdict.ANALYSIS_UNAVAILABLE,
+      confidence: "LOW",
+      checks: [
+        {
+          name: "format-conversion",
+          status: "FAILED",
+          detail: message,
+        },
+      ],
+      changes: [],
+      notChecked: ["image-content"],
+    };
+    await logVerification(cert.certId, "ANALYSIS_UNAVAILABLE", uploadedSha256);
+    return finalizeVerifyResponse(
+      {
+        result: "ANALYSIS_UNAVAILABLE",
+        uploadedSha256,
+        certId: cert.certId,
+        certificate: publicCertificateView(cert),
+        analysis,
+        explanation: explainAnalysis(analysis),
+        signatureValid,
+        legacyRecord: legacyFlag(cert),
+        message,
+        imageAnalysis: {
+          watermark: watermarkInfo,
+          visualDistance: 0,
+          tamperScore: 0,
+          changedPercent: 0,
+          changedRegions: 0,
+          changedCells: [],
+          gridSize: cert.gridSize || getConfig().imageGridSize,
+          width: cert.width ?? 0,
+          height: cert.height ?? 0,
+          matchedBy,
+          reason: `unsupported format: ${label}`,
+        },
+      },
+      revocation,
+    );
+  }
+
+  let uploadedPixels: PixelBuffer;
+  try {
+    uploadedPixels = await decodeImage(uploadedBytes);
+  } catch (err) {
+    const label =
+      format === "unknown" ? "unknown" : formatDisplayName(format);
+    const message = `Unsupported image format (${label}). Convert to PNG, JPEG, or WebP and try again.`;
+    const analysis: AnalysisResult = {
+      verdict: Verdict.ANALYSIS_UNAVAILABLE,
+      confidence: "LOW",
+      checks: [
+        {
+          name: "format-conversion",
+          status: "FAILED",
+          detail: `${message}${err instanceof Error ? ` (${err.message})` : ""}`,
+        },
+      ],
+      changes: [],
+      notChecked: ["image-content"],
+    };
+    await logVerification(cert.certId, "ANALYSIS_UNAVAILABLE", uploadedSha256);
+    return finalizeVerifyResponse(
+      {
+        result: "ANALYSIS_UNAVAILABLE",
+        uploadedSha256,
+        certId: cert.certId,
+        certificate: publicCertificateView(cert),
+        analysis,
+        explanation: explainAnalysis(analysis),
+        signatureValid,
+        legacyRecord: legacyFlag(cert),
+        message,
+        imageAnalysis: {
+          watermark: watermarkInfo,
+          visualDistance: 0,
+          tamperScore: 0,
+          changedPercent: 0,
+          changedRegions: 0,
+          changedCells: [],
+          gridSize: cert.gridSize || getConfig().imageGridSize,
+          width: cert.width ?? 0,
+          height: cert.height ?? 0,
+          matchedBy,
+          reason: "decode failed",
+        },
+      },
+      revocation,
+    );
+  }
+
+  return verifyImagePixelsAgainstCert(
+    cert,
+    uploadedPixels,
+    uploadedSha256,
+    matchedBy,
+    watermarkInfo,
+    signatureValid,
     revocation,
   );
 }
@@ -755,31 +1007,16 @@ export async function verifyUpload(
 
       const revocation = await checkCertificateRevocation(cert);
 
-      // If the matched cert is an image cert but upload wasn't detected as image,
-      // still try image analysis when possible
+      // Image cert + non-image upload (e.g. PDF of the certified PNG): never
+      // fall through to binary diff — that produces misleading dimensions.
       if (cert.imagePhash) {
-        try {
-          return await verifyImageAgainstCert(
-            cert,
-            uploadedBytes,
-            uploadedSha256,
-            "certId",
-            { found: false, confidence: 0 },
-          );
-        } catch (err) {
-          if (err instanceof AppError && err.code === "STORED_FILE_INTEGRITY") {
-            await logVerification(
-              cert.certId,
-              "ANALYSIS_UNAVAILABLE",
-              uploadedSha256,
-            );
-            return finalizeVerifyResponse(
-              storedIntegrityUnavailable(cert, uploadedSha256, true),
-              revocation,
-            );
-          }
-          // fall through to binary/text diff
-        }
+        return await verifyImageAgainstCert(
+          cert,
+          uploadedBytes,
+          uploadedSha256,
+          "certId",
+          { found: false, confidence: 0 },
+        );
       }
 
       let originalBuf: Buffer;

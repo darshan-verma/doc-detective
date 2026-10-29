@@ -3,31 +3,50 @@ import { Verdict } from "../src/lib/analysis/types";
 import { explainAnalysis, bannerTone } from "../src/lib/explain";
 
 describe("explainAnalysis", () => {
-  const verdicts = [
-    Verdict.AUTHENTIC,
-    Verdict.MODIFIED_FORMAT_ONLY,
-    Verdict.TAMPERED,
-    Verdict.NOT_FOUND,
-    Verdict.ANALYSIS_UNAVAILABLE,
-  ];
+  it("AUTHENTIC disclaimer confirms unchanged bytes", () => {
+    const plain = explainAnalysis({
+      verdict: Verdict.AUTHENTIC,
+      confidence: "HIGH",
+      checks: [{ name: "sha256", status: "PASSED" }],
+      changes: [],
+      notChecked: [],
+    });
+    expect(plain.disclaimer).toMatch(/unchanged since it was certified/i);
+    expect(plain.disclaimer).toMatch(/not that its original contents are true/i);
+  });
 
-  for (const verdict of verdicts) {
-    it(`produces explanation for ${verdict}`, () => {
+  it("MODIFIED_FORMAT_ONLY disclaimer says re-saved", () => {
+    const plain = explainAnalysis({
+      verdict: Verdict.MODIFIED_FORMAT_ONLY,
+      confidence: "MEDIUM",
+      checks: [{ name: "file-properties", status: "FAILED" }],
+      changes: [],
+      notChecked: [],
+    });
+    expect(plain.disclaimer).toMatch(/visible content matches/i);
+    expect(plain.disclaimer).toMatch(/re-saved/i);
+    expect(plain.disclaimer).not.toMatch(/unchanged since it was certified/i);
+  });
+
+  it("TAMPERED and ANALYSIS_UNAVAILABLE have no unchanged disclaimer", () => {
+    for (const verdict of [
+      Verdict.TAMPERED,
+      Verdict.ANALYSIS_UNAVAILABLE,
+      Verdict.NOT_FOUND,
+    ]) {
       const plain = explainAnalysis({
         verdict,
         confidence: "HIGH",
-        checks: [{ name: "text", status: "PASSED" }],
+        checks: [{ name: "text", status: "FAILED" }],
         changes: [],
-        notChecked: ["ocr"],
+        notChecked: [],
       });
-      expect(plain.headline.length).toBeGreaterThan(0);
-      expect(plain.explanation.length).toBeGreaterThan(10);
-      expect(plain.whatWeCouldNotCheck).toContain("ocr");
-      expect(plain.disclaimer).toMatch(/not that its original contents are true/i);
-    });
-  }
+      expect(plain.disclaimer).toBe("");
+      expect(plain.disclaimer).not.toMatch(/unchanged/i);
+    }
+  });
 
-  it("shows REVOKED notice", () => {
+  it("REVOKED has no unchanged disclaimer", () => {
     const plain = explainAnalysis(
       {
         verdict: Verdict.AUTHENTIC,
@@ -39,7 +58,29 @@ describe("explainAnalysis", () => {
       { revoked: true },
     );
     expect(plain.headline).toBe("REVOKED");
+    expect(plain.disclaimer).toBe("");
   });
+
+  for (const verdict of [
+    Verdict.AUTHENTIC,
+    Verdict.MODIFIED_FORMAT_ONLY,
+    Verdict.TAMPERED,
+    Verdict.NOT_FOUND,
+    Verdict.ANALYSIS_UNAVAILABLE,
+  ]) {
+    it(`produces explanation for ${verdict}`, () => {
+      const plain = explainAnalysis({
+        verdict,
+        confidence: "HIGH",
+        checks: [{ name: "text", status: "PASSED" }],
+        changes: [],
+        notChecked: ["ocr"],
+      });
+      expect(plain.headline.length).toBeGreaterThan(0);
+      expect(plain.explanation.length).toBeGreaterThan(10);
+      expect(plain.whatWeCouldNotCheck).toContain("ocr");
+    });
+  }
 
   it("maps banner tones", () => {
     expect(bannerTone(Verdict.AUTHENTIC)).toBe("green");
@@ -75,5 +116,6 @@ describe("explainAnalysis", () => {
     expect(plain.confidenceBadge.reason).toMatch(/text and appearance/i);
     expect(plain.formatDifferences).toHaveLength(1);
     expect(plain.whatWeChecked[0]?.label).toBe("Text");
+    expect(plain.disclaimer).toBe("");
   });
 });

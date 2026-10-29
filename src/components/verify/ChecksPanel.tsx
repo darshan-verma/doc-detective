@@ -127,7 +127,9 @@ export function ChecksPanel({
         </div>
       )}
 
-      <p className="text-xs text-zinc-500">{disclaimer}</p>
+      {disclaimer ? (
+        <p className="text-xs text-zinc-500">{disclaimer}</p>
+      ) : null}
     </div>
   );
 }
