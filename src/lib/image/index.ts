@@ -14,8 +14,12 @@ export {
   isPdfBuffer,
   isSharpDecodableImageFormat,
   PDF_IMAGE_UNAVAILABLE_MESSAGE,
+  PDF_OVERLAY_TAMPER_REASON,
+  rectsOverlap,
   type BufferFormat,
+  type PageRect,
   type PdfImageExtractResult,
+  type PdfOverlayElement,
 } from "./from-pdf";
 export {
   phash64,

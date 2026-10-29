@@ -4,7 +4,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, PDFString, rgb, StandardFonts } from "pdf-lib";
 import sharp from "sharp";
 import { resetConfigCache } from "../src/lib/config";
 import { LocalDiskStorage, setStorage } from "../src/lib/storage";
@@ -120,6 +120,105 @@ async function embedPngInPdf(
   return Buffer.from(await pdfDoc.save());
 }
 
+/** Image + white rectangle + "999" text drawn over it (content stream). */
+async function embedPngWithDrawnOverlay(pngBytes: Buffer): Promise<Buffer> {
+  const pdfDoc = await PDFDocument.create();
+  const png = await pdfDoc.embedPng(pngBytes);
+  const page = pdfDoc.addPage([png.width, png.height]);
+  page.drawImage(png, {
+    x: 0,
+    y: 0,
+    width: png.width,
+    height: png.height,
+  });
+  page.drawRectangle({
+    x: 10,
+    y: 10,
+    width: 28,
+    height: 20,
+    color: rgb(1, 1, 1),
+  });
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  page.drawText("999", {
+    x: 12,
+    y: 14,
+    size: 12,
+    font,
+    color: rgb(0, 0, 0),
+  });
+  return Buffer.from(await pdfDoc.save());
+}
+
+async function embedPngWithSquareAnnotation(pngBytes: Buffer): Promise<Buffer> {
+  const pdfDoc = await PDFDocument.create();
+  const png = await pdfDoc.embedPng(pngBytes);
+  const page = pdfDoc.addPage([png.width, png.height]);
+  page.drawImage(png, {
+    x: 0,
+    y: 0,
+    width: png.width,
+    height: png.height,
+  });
+  const annot = pdfDoc.context.obj({
+    Type: "Annot",
+    Subtype: "Square",
+    Rect: [10, 10, 40, 40],
+    IC: [1, 1, 1],
+    C: [1, 0, 0],
+    F: 4,
+  });
+  page.node.addAnnot(pdfDoc.context.register(annot));
+  return Buffer.from(await pdfDoc.save());
+}
+
+async function embedPngWithFreeTextAnnotation(pngBytes: Buffer): Promise<Buffer> {
+  const pdfDoc = await PDFDocument.create();
+  const png = await pdfDoc.embedPng(pngBytes);
+  const page = pdfDoc.addPage([png.width, png.height]);
+  page.drawImage(png, {
+    x: 0,
+    y: 0,
+    width: png.width,
+    height: png.height,
+  });
+  const annot = pdfDoc.context.obj({
+    Type: "Annot",
+    Subtype: "FreeText",
+    Rect: [8, 20, 55, 42],
+    Contents: PDFString.of("999"),
+    F: 4,
+    DA: PDFString.of("/Helv 12 Tf 0 0 0 rg"),
+  });
+  page.node.addAnnot(pdfDoc.context.register(annot));
+  return Buffer.from(await pdfDoc.save());
+}
+
+/** Image on A4 with margins; optional footer text below the image. */
+async function embedPngOnA4(
+  pngBytes: Buffer,
+  opts?: { footerOutside?: boolean },
+): Promise<Buffer> {
+  const pdfDoc = await PDFDocument.create();
+  const png = await pdfDoc.embedPng(pngBytes);
+  const page = pdfDoc.addPage([595, 842]);
+  const drawW = 300;
+  const drawH = (png.height / png.width) * drawW;
+  const x = 100;
+  const y = 400;
+  page.drawImage(png, { x, y, width: drawW, height: drawH });
+  if (opts?.footerOutside) {
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    page.drawText("Certified copy — footer", {
+      x: 100,
+      y: 40,
+      size: 10,
+      font,
+      color: rgb(0.2, 0.2, 0.2),
+    });
+  }
+  return Buffer.from(await pdfDoc.save());
+}
+
 describe("image cert verified via PDF upload", () => {
   beforeEach(async () => {
     await prisma.verificationLog.deleteMany();
@@ -153,10 +252,102 @@ describe("image cert verified via PDF upload", () => {
           /Uploaded as PDF/i.test(c.detail ?? ""),
       ),
     ).toBe(true);
+    expect(
+      result.analysis?.checks.some((c) => c.name === "pdf-overlay"),
+    ).toBeFalsy();
     expect(result.explanation?.disclaimer).toMatch(/re-saved/i);
     expect(result.explanation?.disclaimer).not.toMatch(
       /unchanged since it was certified/i,
     );
+  });
+
+  it("drawRectangle/drawText over the image → TAMPERED", async () => {
+    const buf = await texturedImage(128, 128);
+    const certified = await certifyUpload(makeFile(buf, "over.png"));
+    const originalPng = await loadCertifiedPng(certified.certId);
+    const pdf = await embedPngWithDrawnOverlay(originalPng);
+
+    const result = await verifyUpload(
+      makeFile(pdf, "over.pdf", "application/pdf"),
+      certified.certId,
+    );
+    expect(result.result).toBe("TAMPERED");
+    expect(result.imageAnalysis?.reason).toMatch(/drawn over the image/i);
+    expect(
+      result.analysis?.checks.some(
+        (c) => c.name === "pdf-overlay" && c.status === "FAILED",
+      ),
+    ).toBe(true);
+    expect(result.explanation?.disclaimer ?? "").not.toMatch(/unchanged/i);
+  });
+
+  it("white Square annotation over the image → TAMPERED", async () => {
+    const buf = await texturedImage(128, 128);
+    const certified = await certifyUpload(makeFile(buf, "sq.png"));
+    const originalPng = await loadCertifiedPng(certified.certId);
+    const pdf = await embedPngWithSquareAnnotation(originalPng);
+
+    const result = await verifyUpload(
+      makeFile(pdf, "sq.pdf", "application/pdf"),
+      certified.certId,
+    );
+    expect(result.result).toBe("TAMPERED");
+    expect(
+      result.analysis?.checks.some(
+        (c) => c.name === "pdf-overlay" && c.status === "FAILED",
+      ),
+    ).toBe(true);
+  });
+
+  it("FreeText annotation over the image → TAMPERED", async () => {
+    const buf = await texturedImage(128, 128);
+    const certified = await certifyUpload(makeFile(buf, "ft.png"));
+    const originalPng = await loadCertifiedPng(certified.certId);
+    const pdf = await embedPngWithFreeTextAnnotation(originalPng);
+
+    const result = await verifyUpload(
+      makeFile(pdf, "ft.pdf", "application/pdf"),
+      certified.certId,
+    );
+    expect(result.result).toBe("TAMPERED");
+    expect(
+      result.analysis?.checks.some(
+        (c) => c.name === "pdf-overlay" && c.status === "FAILED",
+      ),
+    ).toBe(true);
+  });
+
+  it("footer text outside the image area → not TAMPERED (note only)", async () => {
+    const buf = await texturedImage(128, 128);
+    const certified = await certifyUpload(makeFile(buf, "foot.png"));
+    const originalPng = await loadCertifiedPng(certified.certId);
+    const pdf = await embedPngOnA4(originalPng, { footerOutside: true });
+
+    const result = await verifyUpload(
+      makeFile(pdf, "foot.pdf", "application/pdf"),
+      certified.certId,
+    );
+    expect(result.result).toBe("MODIFIED_REENCODED");
+    expect(
+      result.analysis?.checks.some((c) => c.name === "pdf-overlay"),
+    ).toBeFalsy();
+    expect(
+      result.analysis?.checks.find((c) => c.name === "format-conversion")
+        ?.detail,
+    ).toMatch(/outside the image area/i);
+  });
+
+  it("image scaled onto A4 with margins → MODIFIED_REENCODED", async () => {
+    const buf = await texturedImage(128, 128);
+    const certified = await certifyUpload(makeFile(buf, "a4.png"));
+    const originalPng = await loadCertifiedPng(certified.certId);
+    const pdf = await embedPngOnA4(originalPng);
+
+    const result = await verifyUpload(
+      makeFile(pdf, "a4.pdf", "application/pdf"),
+      certified.certId,
+    );
+    expect(result.result).toBe("MODIFIED_REENCODED");
   });
 
   it("painted region then embedded in PDF → TAMPERED", async () => {

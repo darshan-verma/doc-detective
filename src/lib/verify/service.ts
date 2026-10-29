@@ -48,6 +48,7 @@ import {
   isPdfBuffer,
   isSharpDecodableImageFormat,
   PDF_IMAGE_UNAVAILABLE_MESSAGE,
+  PDF_OVERLAY_TAMPER_REASON,
   phash64,
   resizePixels,
   type CellSignature,
@@ -285,6 +286,18 @@ function withImageAnalysisPayload(
   };
 }
 
+interface ImageVerifyOptions {
+  extraChecks?: CheckResult[];
+  /** Structural / overlay force — verdict cannot be better than TAMPERED. */
+  forceTamperedReason?: string;
+  forceTamperedRegions?: LocalizedRegion[];
+  /**
+   * When false (PDF with extra image draws / overlays), refuse MODIFIED_REENCODED
+   * even if pixels match.
+   */
+  allowModifiedReencoded?: boolean;
+}
+
 /**
  * Verify an image certificate against already-decoded (or PDF-extracted) pixels.
  */
@@ -296,8 +309,14 @@ async function verifyImagePixelsAgainstCert(
   watermarkInfo: { found: boolean; confidence: number },
   signatureValid: boolean,
   revocation: RevocationLogCheck,
-  extraChecks: CheckResult[] = [],
+  options: ImageVerifyOptions = {},
 ): Promise<VerifyResponse> {
+  const {
+    extraChecks = [],
+    forceTamperedReason,
+    forceTamperedRegions,
+    allowModifiedReencoded = true,
+  } = options;
   const config = getConfig();
 
   const origW = cert.width ?? uploadedPixels.width;
@@ -509,6 +528,31 @@ async function verifyImagePixelsAgainstCert(
     }
   }
 
+  // PDF overlays / structural rules: cannot report better than TAMPERED.
+  // Prefer the overlay reason even when cells already flagged tampering —
+  // that is the user-visible explanation for PDF markup / drawn-over attacks.
+  if (forceTamperedReason) {
+    classified = {
+      classification: "TAMPERED",
+      reason: forceTamperedReason,
+    };
+    imageAnalysis.changeClass = "TAMPERED";
+    imageAnalysis.reason = forceTamperedReason;
+    if (forceTamperedRegions?.length) {
+      imageAnalysis.localizedRegions = forceTamperedRegions;
+    }
+  } else if (
+    !allowModifiedReencoded &&
+    classified.classification !== "TAMPERED"
+  ) {
+    classified = {
+      classification: "TAMPERED",
+      reason: PDF_OVERLAY_TAMPER_REASON,
+    };
+    imageAnalysis.changeClass = "TAMPERED";
+    imageAnalysis.reason = classified.reason;
+  }
+
   if (revocation.revoked) {
     await logVerification(cert.certId, "REVOKED", uploadedSha256);
     const revokeNote = revokeDisplayMessage(revocation, cert.revokeReason);
@@ -574,6 +618,181 @@ async function verifyImagePixelsAgainstCert(
   });
 }
 
+type PdfImageExtractOk = Extract<
+  Awaited<ReturnType<typeof extractImagePixelsFromPdf>>,
+  { ok: true }
+>;
+
+function formatConversionDetail(extracted: PdfImageExtractOk): string {
+  const outside = extracted.overlays.filter((o) => !o.overlapsImage);
+  let detail =
+    "Uploaded as PDF; compared the visible page content in the image area";
+  if (outside.length > 0) {
+    const kinds = [...new Set(outside.map((o) => o.kind))].join(", ");
+    detail += ` (also has ${kinds} outside the image area)`;
+  }
+  return detail;
+}
+
+async function diagnosePdfImageOverlays(
+  extracted: PdfImageExtractOk,
+  targetW: number,
+  targetH: number,
+): Promise<{
+  forceTamperedReason?: string;
+  forceTamperedRegions?: LocalizedRegion[];
+  overlayCheck?: CheckResult;
+}> {
+  const overlapping = extracted.overlays.filter((o) => o.overlapsImage);
+  let forceTamperedReason: string | undefined;
+  let forceTamperedRegions: LocalizedRegion[] | undefined;
+  let overlayCheck: CheckResult | undefined;
+
+  if (overlapping.length > 0 || extracted.imageDrawCount !== 1) {
+    const details = overlapping.map((o) => o.detail).join("; ");
+    overlayCheck = {
+      name: "pdf-overlay",
+      status: "FAILED",
+      detail:
+        overlapping.length > 0
+          ? `Visible content overlaps the image area: ${details || "unknown"}`
+          : `PDF has ${extracted.imageDrawCount} image draws; expected exactly one`,
+    };
+    forceTamperedReason = PDF_OVERLAY_TAMPER_REASON;
+  }
+
+  if (extracted.embeddedPixels) {
+    try {
+      let embedded = extracted.embeddedPixels;
+      if (embedded.width !== targetW || embedded.height !== targetH) {
+        embedded = await resizePixels(embedded, targetW, targetH);
+      }
+      let rendered = extracted.pixels;
+      if (rendered.width !== targetW || rendered.height !== targetH) {
+        rendered = await resizePixels(rendered, targetW, targetH);
+      }
+      const pixel = await detectLocalizedPixelTamper(embedded, rendered, {
+        minRegionArea: getConfig().pixelMinRegionArea,
+        outlierK: getConfig().outlierK,
+      });
+      if (pixel.tampered) {
+        forceTamperedReason = PDF_OVERLAY_TAMPER_REASON;
+        forceTamperedRegions = pixel.regions;
+        if (!overlayCheck) {
+          overlayCheck = {
+            name: "pdf-overlay",
+            status: "FAILED",
+            detail: PDF_OVERLAY_TAMPER_REASON,
+          };
+        }
+      }
+    } catch (err) {
+      console.error("[diagnosePdfImageOverlays] embedded vs rendered failed", err);
+    }
+  }
+
+  return { forceTamperedReason, forceTamperedRegions, overlayCheck };
+}
+
+/**
+ * Image-certificate verify when the upload is a PDF (Preview export, etc.).
+ * Always uses rendered page pixels (annotations painted); embedded XObject
+ * is diagnostic only.
+ */
+async function verifyImageCertFromPdf(
+  cert: Certificate,
+  uploadedBytes: Buffer,
+  uploadedSha256: string,
+  matchedBy: MatchedBy,
+  watermarkInfo: { found: boolean; confidence: number },
+  signatureValid: boolean,
+  revocation: RevocationLogCheck,
+): Promise<VerifyResponse> {
+  const extracted = await extractImagePixelsFromPdf(uploadedBytes, {
+    width: cert.width,
+    height: cert.height,
+  });
+  if (!extracted.ok) {
+    const analysis: AnalysisResult = {
+      verdict: Verdict.ANALYSIS_UNAVAILABLE,
+      confidence: "LOW",
+      checks: [
+        {
+          name: "format-conversion",
+          status: "FAILED",
+          detail: PDF_IMAGE_UNAVAILABLE_MESSAGE,
+        },
+      ],
+      changes: [],
+      notChecked: ["image-content"],
+    };
+    await logVerification(cert.certId, "ANALYSIS_UNAVAILABLE", uploadedSha256);
+    return finalizeVerifyResponse(
+      {
+        result: "ANALYSIS_UNAVAILABLE",
+        uploadedSha256,
+        certId: cert.certId,
+        certificate: publicCertificateView(cert),
+        analysis,
+        explanation: explainAnalysis(analysis),
+        signatureValid,
+        legacyRecord: legacyFlag(cert),
+        message: PDF_IMAGE_UNAVAILABLE_MESSAGE,
+        imageAnalysis: {
+          watermark: watermarkInfo,
+          visualDistance: 0,
+          tamperScore: 0,
+          changedPercent: 0,
+          changedRegions: 0,
+          changedCells: [],
+          gridSize: cert.gridSize || getConfig().imageGridSize,
+          width: cert.width ?? 0,
+          height: cert.height ?? 0,
+          matchedBy,
+          reason: extracted.reason,
+        },
+      },
+      revocation,
+    );
+  }
+
+  const targetW = cert.width ?? extracted.pixels.width;
+  const targetH = cert.height ?? extracted.pixels.height;
+  const diagnosis = await diagnosePdfImageOverlays(
+    extracted,
+    targetW,
+    targetH,
+  );
+
+  const extraChecks: CheckResult[] = [
+    {
+      name: "format-conversion",
+      status: "PASSED",
+      detail: formatConversionDetail(extracted),
+    },
+  ];
+  if (diagnosis.overlayCheck) {
+    extraChecks.push(diagnosis.overlayCheck);
+  }
+
+  return verifyImagePixelsAgainstCert(
+    cert,
+    extracted.pixels,
+    uploadedSha256,
+    matchedBy,
+    watermarkInfo,
+    signatureValid,
+    revocation,
+    {
+      extraChecks,
+      forceTamperedReason: diagnosis.forceTamperedReason,
+      forceTamperedRegions: diagnosis.forceTamperedRegions,
+      allowModifiedReencoded:
+        extracted.cleanSingleImage && !diagnosis.forceTamperedReason,
+    },
+  );
+}
+
 /**
  * Resolve upload bytes (including PDF wrappers / unsupported formats) then
  * verify against an image certificate. Never falls through to binary diff.
@@ -594,69 +813,14 @@ async function verifyImageAgainstCert(
   const revocation = await checkCertificateRevocation(cert);
 
   if (isPdfBuffer(uploadedBytes)) {
-    const extracted = await extractImagePixelsFromPdf(uploadedBytes, {
-      width: cert.width,
-      height: cert.height,
-    });
-    if (!extracted.ok) {
-      const analysis: AnalysisResult = {
-        verdict: Verdict.ANALYSIS_UNAVAILABLE,
-        confidence: "LOW",
-        checks: [
-          {
-            name: "format-conversion",
-            status: "FAILED",
-            detail: PDF_IMAGE_UNAVAILABLE_MESSAGE,
-          },
-        ],
-        changes: [],
-        notChecked: ["image-content"],
-      };
-      await logVerification(cert.certId, "ANALYSIS_UNAVAILABLE", uploadedSha256);
-      return finalizeVerifyResponse(
-        {
-          result: "ANALYSIS_UNAVAILABLE",
-          uploadedSha256,
-          certId: cert.certId,
-          certificate: publicCertificateView(cert),
-          analysis,
-          explanation: explainAnalysis(analysis),
-          signatureValid,
-          legacyRecord: legacyFlag(cert),
-          message: PDF_IMAGE_UNAVAILABLE_MESSAGE,
-          imageAnalysis: {
-            watermark: watermarkInfo,
-            visualDistance: 0,
-            tamperScore: 0,
-            changedPercent: 0,
-            changedRegions: 0,
-            changedCells: [],
-            gridSize: cert.gridSize || getConfig().imageGridSize,
-            width: cert.width ?? 0,
-            height: cert.height ?? 0,
-            matchedBy,
-            reason: extracted.reason,
-          },
-        },
-        revocation,
-      );
-    }
-
-    return verifyImagePixelsAgainstCert(
+    return verifyImageCertFromPdf(
       cert,
-      extracted.pixels,
+      uploadedBytes,
       uploadedSha256,
       matchedBy,
       watermarkInfo,
       signatureValid,
       revocation,
-      [
-        {
-          name: "format-conversion",
-          status: "PASSED",
-          detail: "Uploaded as PDF; compared the image embedded in the PDF",
-        },
-      ],
     );
   }
 
