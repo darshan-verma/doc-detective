@@ -209,7 +209,7 @@ export function applyLogIntegrityToVerifyResponse<
   T extends {
     result: string;
     message: string;
-    analysis?: { confidence: string; [key: string]: unknown };
+    analysis?: { confidence: string };
     logIntegrity?: LogIntegrity;
   },
 >(

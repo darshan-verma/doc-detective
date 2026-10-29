@@ -276,13 +276,21 @@ interface PageStructure {
   overlays: PdfOverlayElement[];
 }
 
+function numbersFromUnknown(value: unknown): number[] | null {
+  if (Array.isArray(value)) {
+    return value.map((v) => Number(v));
+  }
+  if (ArrayBuffer.isView(value)) {
+    return Array.from(value as unknown as ArrayLike<number>).map((v) =>
+      Number(v),
+    );
+  }
+  return null;
+}
+
 function asMatrix(args: unknown): Matrix | null {
   if (!args) return null;
-  const arr = Array.isArray(args)
-    ? args
-    : ArrayBuffer.isView(args)
-      ? Array.from(args as ArrayLike<number>)
-      : null;
+  const arr = numbersFromUnknown(args);
   if (!arr || arr.length < 6) return null;
   return [
     Number(arr[0]),
@@ -297,11 +305,7 @@ function asMatrix(args: unknown): Matrix | null {
 function localBBoxFromArgs(args: unknown[]): PageRect | null {
   const maybe = args[2] ?? args[1];
   if (!maybe) return null;
-  const arr = Array.isArray(maybe)
-    ? maybe
-    : ArrayBuffer.isView(maybe)
-      ? Array.from(maybe as ArrayLike<number>)
-      : null;
+  const arr = numbersFromUnknown(maybe);
   if (!arr || arr.length < 4) return null;
   const x0 = Number(arr[0]);
   const y0 = Number(arr[1]);

@@ -137,10 +137,9 @@ async function finalizeVerifyResponse(
   if (next.logIntegrity === "BROKEN" && next.analysis) {
     return {
       ...next,
-      explanation: explainAnalysis(
-        next.analysis as Parameters<typeof explainAnalysis>[0],
-        { revoked: next.result === "REVOKED" },
-      ),
+      explanation: explainAnalysis(next.analysis, {
+        revoked: next.result === "REVOKED",
+      }),
     };
   }
   return next;
@@ -264,7 +263,7 @@ function withImageAnalysisPayload(
   const checks: CheckResult[] =
     extraChecks.length > 0
       ? extraChecks
-      : response.analysis?.checks ?? [
+      : [
           {
             name: "image-content",
             status:
