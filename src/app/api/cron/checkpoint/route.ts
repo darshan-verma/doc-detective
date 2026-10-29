@@ -1,4 +1,5 @@
 import { AppError, errorResponse } from "@/lib/errors";
+import { verifyAndRecordLogChain } from "@/lib/trust/log";
 import { runCheckpointJob } from "@/lib/trust/timestamp/checkpoint";
 
 export const runtime = "nodejs";
@@ -28,8 +29,9 @@ export async function POST(request: Request) {
     }
 
     const force = url.searchParams.get("force") === "1";
+    const chain = await verifyAndRecordLogChain();
     const result = await runCheckpointJob({ force });
-    return Response.json(result);
+    return Response.json({ ...result, chain });
   } catch (err) {
     return errorResponse(err);
   }

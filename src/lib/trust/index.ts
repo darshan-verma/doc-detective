@@ -21,11 +21,20 @@ export type { SigningProvider, SignResult, PublicKeyInfo } from "./keys";
 export {
   appendLogEntry,
   verifyLogChain,
+  verifyLogEntries,
+  verifyAndRecordLogChain,
+  recordLogChainStatus,
+  getLogChainStatus,
   computeEntryHash,
+  recomputeStoredEntryHash,
   hashCertificateRecord,
   hashRevokeRecord,
   checkCertificateRevocation,
+  evaluateRevocationFromEntries,
+  revokeDisplayMessage,
   GENESIS_PREV_HASH,
+  LOG_ENTRY_DOMAIN_V2,
+  LOG_CHAIN_STATUS_ID,
 } from "./log";
 export type { LogEventType, ChainVerifyResult, RevocationLogCheck } from "./log";
 

@@ -72,20 +72,33 @@ model VerificationLog {
 
 /// Append-only hash-chained transparency log. No update/delete paths in app code.
 model LogEntry {
-  id         String   @id @default(auto()) @map("_id") @db.ObjectId
-  seq        Int      @unique
-  certId     String?
-  eventType  String // CERTIFICATE_CREATED | CERTIFICATE_REVOKED | KEY_ROTATION
-  recordHash String
-  prevHash   String
-  entryHash  String
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  seq          Int      @unique
+  certId       String?
+  eventType    String // CERTIFICATE_CREATED | CERTIFICATE_REVOKED | KEY_ROTATION
+  recordHash   String
+  prevHash     String
+  entryHash    String
+  /// 1 = legacy (seq|prev|record|time only); 2 = binds certId, eventType, details.
+  entryVersion Int      @default(1)
   /// Optional JSON metadata (e.g. { similarToCertId }).
-  details    String?
-  createdAt  DateTime @default(now())
+  details      String?
+  createdAt    DateTime @default(now())
 
   @@index([certId])
   @@index([certId, eventType])
   @@index([createdAt])
+}
+
+/// Latest full-chain verification result (upserted by checkpoint cron).
+model LogChainStatus {
+  id          String   @id @map("_id")
+  verifiedAt  DateTime
+  ok          Boolean
+  brokenAt    Int?
+  checkedFrom Int
+  checkedTo   Int
+  reason      String?
 }
 
 model Checkpoint {

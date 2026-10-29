@@ -24,7 +24,10 @@ import { diffFiles, type DiffResult } from "../diff";
 import { AppError } from "../errors";
 import { parseCertIdFromFilename } from "../filenames";
 import { isLegacySignatureVersion } from "../signing";
-import { checkCertificateRevocation } from "../trust";
+import {
+  checkCertificateRevocation,
+  revokeDisplayMessage,
+} from "../trust";
 import {
   aspectDiffers,
   cellSignatures,
@@ -99,6 +102,8 @@ export interface VerifyResponse {
   imageAnalysis?: ImageVerifyAnalysis;
   /** True when signatureVersion < 2 (analysis fields not covered by signature). */
   legacyRecord?: boolean;
+  /** When REVOKED: whether log-bound reason/time verified. */
+  detailsVerified?: boolean;
 }
 
 function legacyFlag(cert: Certificate): boolean {
@@ -395,6 +400,7 @@ async function verifyImageAgainstCert(
 
   if (revocation.revoked) {
     await logVerification(cert.certId, "REVOKED", uploadedSha256);
+    const revokeNote = revokeDisplayMessage(revocation, cert.revokeReason);
     return {
       result: "REVOKED",
       uploadedSha256,
@@ -402,8 +408,10 @@ async function verifyImageAgainstCert(
       certificate: publicCertificateView(cert),
       signatureValid,
       legacyRecord: legacyFlag(cert),
-      message:
-        "Certificate has been revoked. Do not treat this file as currently certified.",
+      detailsVerified: revocation.detailsVerified,
+      message: revocation.detailsVerified
+        ? "Certificate has been revoked. Do not treat this file as currently certified."
+        : `${revokeNote}. Do not treat this file as currently certified.`,
       imageAnalysis: analysis,
     };
   }
@@ -543,6 +551,7 @@ export async function verifyUpload(
         changes: [],
         notChecked: [],
       };
+      const revokeNote = revokeDisplayMessage(revocation, byHash.revokeReason);
       return {
         result: "REVOKED",
         uploadedSha256,
@@ -552,8 +561,10 @@ export async function verifyUpload(
         explanation: explainAnalysis(analysis, { revoked: true }),
         signatureValid: true,
         legacyRecord: legacyFlag(byHash),
-        message:
-          "Certificate has been revoked. Bytes match, but this certificate is no longer valid.",
+        detailsVerified: revocation.detailsVerified,
+        message: revocation.detailsVerified
+          ? "Certificate has been revoked. Bytes match, but this certificate is no longer valid."
+          : `${revokeNote}. Bytes match, but this certificate is no longer valid.`,
       };
     }
 
@@ -745,6 +756,7 @@ export async function verifyUpload(
 
       if (revocation.revoked) {
         await logVerification(cert.certId, "REVOKED", uploadedSha256);
+        const revokeNote = revokeDisplayMessage(revocation, cert.revokeReason);
         return {
           result: "REVOKED",
           uploadedSha256,
@@ -754,8 +766,10 @@ export async function verifyUpload(
           explanation: explainAnalysis(analysis, { revoked: true }),
           signatureValid: true,
           legacyRecord: legacyFlag(cert),
-          message:
-            "Certificate has been revoked. Do not treat this file as currently certified.",
+          detailsVerified: revocation.detailsVerified,
+          message: revocation.detailsVerified
+            ? "Certificate has been revoked. Do not treat this file as currently certified."
+            : `${revokeNote}. Do not treat this file as currently certified.`,
         };
       }
 

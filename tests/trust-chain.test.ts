@@ -38,12 +38,17 @@ describe("hash-chained log", () => {
     });
     expect(a.seq).toBe(1);
     expect(a.prevHash).toBe(GENESIS_PREV_HASH);
+    expect(a.entryVersion).toBe(2);
     expect(a.entryHash).toBe(
       computeEntryHash({
         seq: 1,
         prevHash: GENESIS_PREV_HASH,
         recordHash: "r1",
         createdAt: a.createdAt,
+        entryVersion: 2,
+        certId: "AAAA",
+        eventType: "CERTIFICATE_CREATED",
+        details: null,
       }),
     );
 

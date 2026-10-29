@@ -7,6 +7,10 @@ import {
 import { listLineage } from "@/lib/certificates/ownership";
 import { prisma } from "@/lib/prisma";
 import { formatCertId, isValidCertIdFormat, normalizeCertId } from "@/lib/trust/ids";
+import {
+  checkCertificateRevocation,
+  revokeDisplayMessage,
+} from "@/lib/trust/log";
 import { CertificateQr } from "./CertificateExtras";
 
 export const dynamic = "force-dynamic";
@@ -54,6 +58,7 @@ export default async function CertificatePage({
 
   const view = publicCertificateView(cert);
   const lineage = await listLineage(certId);
+  const revocation = await checkCertificateRevocation(cert);
 
   const similarEarlier = cert.similarToCertId
     ? await getCertificateById(cert.similarToCertId)
@@ -74,9 +79,9 @@ export default async function CertificatePage({
           {view.certIdDisplay ?? formatCertId(view.certId)}
         </h1>
         <p className="mt-1 font-mono text-xs text-zinc-500">{view.certId}</p>
-        {view.revokedAt && (
+        {revocation.revoked && (
           <p className="mt-2 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800">
-            REVOKED{view.revokeReason ? `: ${view.revokeReason}` : ""}
+            {revokeDisplayMessage(revocation, view.revokeReason)}
           </p>
         )}
         {view.legacyRecord && (

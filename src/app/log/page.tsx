@@ -1,4 +1,5 @@
 import { prisma } from "@/lib/prisma";
+import { getLogChainStatus } from "@/lib/trust/log";
 import { LogVerifyButton } from "./LogVerifyButton";
 
 export const dynamic = "force-dynamic";
@@ -10,6 +11,7 @@ export default async function LogPage() {
   });
 
   const entryCount = await prisma.logEntry.count();
+  const chainStatus = await getLogChainStatus();
 
   return (
     <div className="space-y-6">
@@ -25,6 +27,30 @@ export default async function LogPage() {
           hash chain ({entryCount.toLocaleString()} log entries).
         </p>
       </div>
+
+      {chainStatus && (
+        <div
+          className={`rounded-md px-4 py-3 text-sm ${
+            chainStatus.ok
+              ? "border border-emerald-200 bg-emerald-50 text-emerald-900"
+              : "border border-rose-200 bg-rose-50 text-rose-900"
+          }`}
+        >
+          {chainStatus.ok ? (
+            <>
+              Chain verified at{" "}
+              {new Date(chainStatus.verifiedAt).toLocaleString()} (seq{" "}
+              {chainStatus.checkedFrom}–{chainStatus.checkedTo}).
+            </>
+          ) : (
+            <>
+              Chain broken at seq {chainStatus.brokenAt}
+              {chainStatus.reason ? `: ${chainStatus.reason}` : ""} (checked{" "}
+              {new Date(chainStatus.verifiedAt).toLocaleString()}).
+            </>
+          )}
+        </div>
+      )}
 
       <LogVerifyButton />
 
