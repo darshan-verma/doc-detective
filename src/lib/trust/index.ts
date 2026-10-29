@@ -31,12 +31,23 @@ export {
   hashRevokeRecord,
   checkCertificateRevocation,
   evaluateRevocationFromEntries,
+  evaluateCertificateLogFromEntries,
   revokeDisplayMessage,
+  isEntryHashValid,
+  assessEntriesIntegrity,
+  brokenLogChainMessage,
+  applyLogIntegrityToVerifyResponse,
   GENESIS_PREV_HASH,
   LOG_ENTRY_DOMAIN_V2,
   LOG_CHAIN_STATUS_ID,
 } from "./log";
-export type { LogEventType, ChainVerifyResult, RevocationLogCheck } from "./log";
+export type {
+  LogEventType,
+  ChainVerifyResult,
+  RevocationLogCheck,
+  EntryIntegrity,
+  LogIntegrity,
+} from "./log";
 
 export {
   buildMerkleTree,

@@ -130,9 +130,12 @@ export function hashRevokeRecord(fields: {
     .digest("hex");
 }
 
+export type EntryIntegrity = "OK" | "DAMAGED";
+export type LogIntegrity = "OK" | "DAMAGED" | "BROKEN";
+
 export interface RevocationLogCheck {
   revoked: boolean;
-  /** True when a valid CERTIFICATE_REVOKED log entry was found. */
+  /** True when any CERTIFICATE_REVOKED log entry was found (hash need not validate). */
   fromLog: boolean;
   /** True when Certificate.revokedAt is set. */
   fromColumn: boolean;
@@ -141,6 +144,100 @@ export interface RevocationLogCheck {
    * v1 recordHash matches reconstructed revoke hash).
    */
   detailsVerified: boolean;
+  /** Integrity of CERTIFICATE_REVOKED entries used for the decision. */
+  entryIntegrity?: EntryIntegrity;
+  /** Integrity of all log rows for this cert, or chain-level BROKEN. */
+  logIntegrity?: LogIntegrity;
+}
+
+/** True when stored entryHash matches a fresh recompute. */
+export function isEntryHashValid(
+  entry: Pick<
+    LogEntry,
+    | "seq"
+    | "prevHash"
+    | "recordHash"
+    | "createdAt"
+    | "entryVersion"
+    | "certId"
+    | "eventType"
+    | "details"
+    | "entryHash"
+  >,
+): boolean {
+  return recomputeStoredEntryHash(entry) === entry.entryHash;
+}
+
+/** OK unless any entry fails entryHash validation. */
+export function assessEntriesIntegrity(
+  entries: Array<
+    Pick<
+      LogEntry,
+      | "seq"
+      | "prevHash"
+      | "recordHash"
+      | "createdAt"
+      | "entryVersion"
+      | "certId"
+      | "eventType"
+      | "details"
+      | "entryHash"
+    >
+  >,
+): EntryIntegrity {
+  for (const entry of entries) {
+    if (!isEntryHashValid(entry)) return "DAMAGED";
+  }
+  return "OK";
+}
+
+export function brokenLogChainMessage(brokenAt: number | null): string {
+  const seq = brokenAt ?? "?";
+  return `The transparency log failed its integrity check at seq ${seq}; results may be unreliable.`;
+}
+
+/**
+ * Merge cert-level log integrity with the latest recorded chain status onto a
+ * verify-shaped response. BROKEN wins over DAMAGED; never leaves AUTHENTIC as
+ * a plain high-confidence result when the chain is broken.
+ */
+export function applyLogIntegrityToVerifyResponse<
+  T extends {
+    result: string;
+    message: string;
+    analysis?: { confidence: string; [key: string]: unknown };
+    logIntegrity?: LogIntegrity;
+  },
+>(
+  response: T,
+  opts: {
+    certLogIntegrity?: LogIntegrity | null;
+    chainStatus?: { ok: boolean; brokenAt: number | null } | null;
+  },
+): T {
+  const certIntegrity = opts.certLogIntegrity;
+  const chainBroken = Boolean(opts.chainStatus && !opts.chainStatus.ok);
+
+  if (chainBroken) {
+    const warn = brokenLogChainMessage(opts.chainStatus!.brokenAt);
+    const wasAuthentic = response.result === "AUTHENTIC";
+    const analysis = response.analysis
+      ? { ...response.analysis, confidence: "LOW" }
+      : undefined;
+    return {
+      ...response,
+      // Keep the content verdict but never as plain high-confidence AUTHENTIC.
+      logIntegrity: "BROKEN",
+      message: wasAuthentic ? warn : `${response.message} ${warn}`.trim(),
+      ...(analysis ? { analysis } : {}),
+    };
+  }
+
+  if (certIntegrity && certIntegrity !== "OK") {
+    return { ...response, logIntegrity: certIntegrity };
+  }
+
+  return response;
 }
 
 function parseRevokeDetails(details: string | null): {
@@ -174,8 +271,8 @@ type RevokeLogEntry = Pick<
 
 /**
  * Pure revocation decision from already-fetched CERTIFICATE_REVOKED entries.
- * A cert is REVOKED if any entry has a valid entryHash — details/recordHash
- * mismatch only affects detailsVerified, not revoked.
+ * Fail closed: ANY CERTIFICATE_REVOKED row for the cert means revoked, even
+ * when entryHash does not validate (entryIntegrity=DAMAGED).
  */
 export function evaluateRevocationFromEntries(
   cert: {
@@ -188,14 +285,26 @@ export function evaluateRevocationFromEntries(
   const fromColumn = Boolean(cert.revokedAt);
   let fromLog = false;
   let detailsVerified = false;
+  let entryIntegrity: EntryIntegrity = "OK";
   let chainCheckFromSeq: number | null = null;
 
   for (const entry of entries) {
-    const recomputed = recomputeStoredEntryHash(entry);
-    if (recomputed !== entry.entryHash) continue;
-
     fromLog = true;
-    chainCheckFromSeq = entry.seq;
+    if (!isEntryHashValid(entry)) {
+      entryIntegrity = "DAMAGED";
+      console.error(
+        "[revoke] CERTIFICATE_REVOKED entry hash mismatch (fail closed)",
+        {
+          certId: cert.certId,
+          seq: entry.seq,
+          storedEntryHash: entry.entryHash,
+          recomputed: recomputeStoredEntryHash(entry),
+        },
+      );
+      continue;
+    }
+
+    if (chainCheckFromSeq == null) chainCheckFromSeq = entry.seq;
 
     const entryVersion = entry.entryVersion ?? 1;
     if (entryVersion >= 2) {
@@ -214,10 +323,14 @@ export function evaluateRevocationFromEntries(
           revokedAt,
           reason,
         });
-        detailsVerified = expected === entry.recordHash;
+        if (expected === entry.recordHash) detailsVerified = true;
       }
     }
-    break;
+  }
+
+  // Damaged revoke records cannot bind reason/time.
+  if (entryIntegrity === "DAMAGED") {
+    detailsVerified = false;
   }
 
   if (fromLog !== fromColumn) {
@@ -232,6 +345,7 @@ export function evaluateRevocationFromEntries(
   if (fromLog && !detailsVerified) {
     console.error("[revoke] revocation details could not be verified", {
       certId: cert.certId,
+      entryIntegrity,
     });
   }
 
@@ -240,24 +354,63 @@ export function evaluateRevocationFromEntries(
     fromLog,
     fromColumn,
     detailsVerified: fromLog ? detailsVerified : fromColumn,
+    entryIntegrity: fromLog ? entryIntegrity : undefined,
     chainCheckFromSeq,
   };
 }
 
 /**
+ * Pure cert log assessment from already-fetched entries (any event type).
+ * Sets logIntegrity=DAMAGED when any row fails entryHash validation.
+ */
+export function evaluateCertificateLogFromEntries(
+  cert: {
+    certId: string;
+    revokedAt: Date | null;
+    revokeReason: string | null;
+  },
+  allEntries: RevokeLogEntry[],
+): RevocationLogCheck & { chainCheckFromSeq: number | null } {
+  const certEntriesIntegrity = assessEntriesIntegrity(allEntries);
+  if (certEntriesIntegrity === "DAMAGED") {
+    console.error("[revoke] damaged log entry for certificate", {
+      certId: cert.certId,
+      damagedSeqs: allEntries
+        .filter((e) => !isEntryHashValid(e))
+        .map((e) => e.seq),
+    });
+  }
+
+  const revokeEntries = allEntries.filter(
+    (e) => e.eventType === "CERTIFICATE_REVOKED",
+  );
+  const evaluated = evaluateRevocationFromEntries(cert, revokeEntries);
+  const logIntegrity: LogIntegrity =
+    certEntriesIntegrity === "DAMAGED" || evaluated.entryIntegrity === "DAMAGED"
+      ? "DAMAGED"
+      : "OK";
+
+  return {
+    ...evaluated,
+    logIntegrity,
+  };
+}
+
+/**
  * Revocation status from the transparency log (primary) and column (secondary).
+ * Also validates every LogEntry for the certId (any event type) for DAMAGED.
  */
 export async function checkCertificateRevocation(cert: {
   certId: string;
   revokedAt: Date | null;
   revokeReason: string | null;
 }): Promise<RevocationLogCheck> {
-  const entries = await prisma.logEntry.findMany({
-    where: { certId: cert.certId, eventType: "CERTIFICATE_REVOKED" },
+  const allEntries = await prisma.logEntry.findMany({
+    where: { certId: cert.certId },
     orderBy: { seq: "asc" },
   });
 
-  const evaluated = evaluateRevocationFromEntries(cert, entries);
+  const evaluated = evaluateCertificateLogFromEntries(cert, allEntries);
   const { chainCheckFromSeq, ...check } = evaluated;
 
   if (chainCheckFromSeq != null) {
@@ -289,6 +442,9 @@ export function revokeDisplayMessage(
   columnReason?: string | null,
 ): string {
   if (!check.revoked) return "";
+  if (check.entryIntegrity === "DAMAGED") {
+    return "Revoked (revocation record shows signs of tampering)";
+  }
   if (check.detailsVerified && columnReason) {
     return `REVOKED: ${columnReason}`;
   }

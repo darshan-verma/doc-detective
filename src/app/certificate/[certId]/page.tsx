@@ -84,6 +84,12 @@ export default async function CertificatePage({
             {revokeDisplayMessage(revocation, view.revokeReason)}
           </p>
         )}
+        {revocation.logIntegrity === "DAMAGED" && !revocation.revoked && (
+          <p className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-900">
+            Log entries for this certificate show signs of tampering; results may
+            be unreliable.
+          </p>
+        )}
         {view.legacyRecord && (
           <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
             Older certificate: analysis data is not covered by the signature.

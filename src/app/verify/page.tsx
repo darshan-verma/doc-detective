@@ -48,6 +48,7 @@ interface VerifyResponse {
   message: string;
   signatureValid?: boolean;
   legacyRecord?: boolean;
+  logIntegrity?: "OK" | "DAMAGED" | "BROKEN";
   diff?: DiffResult;
   imageAnalysis?: ImageAnalysis;
   explanation?: Explanation;
@@ -415,6 +416,19 @@ function VerifyInner() {
                 {result.newerVersion.certId}
               </Link>{" "}
               (v{result.newerVersion.version})
+            </div>
+          )}
+
+          {result.logIntegrity && result.logIntegrity !== "OK" && (
+            <div
+              className="rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-900"
+              role="alert"
+            >
+              {result.logIntegrity === "BROKEN"
+                ? result.message.includes("transparency log failed")
+                  ? result.message
+                  : "The transparency log failed its integrity check; results may be unreliable."
+                : "Log entries for this certificate show signs of tampering; results may be unreliable."}
             </div>
           )}
 
