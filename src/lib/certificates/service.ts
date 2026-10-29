@@ -28,8 +28,11 @@ import { prisma } from "../prisma";
 import {
   getEd25519PublicKeyPem,
   payloadFromCert,
-  signCertificateRecord,
+  payloadFromCertV2,
+  signCertificateRecordV2,
   verifyCertificateSignature,
+  verifyCertificateSignatureV2,
+  verifyCertificateSignatureV2WithKeyId,
   verifyCertificateSignatureWithKeyId,
 } from "../signing";
 import { getStorage } from "../storage";
@@ -151,16 +154,35 @@ async function persistCertificate(args: {
   watermarkVersion?: number;
 }): Promise<Certificate> {
   await syncPublicKeysToDb();
-  const signed = await signCertificateRecord(
-    payloadFromCert({
-      certId: args.certId,
-      sha256: args.sha256,
-      imagePhash: args.imagePhash,
-      width: args.width,
-      height: args.height,
-      createdAt: args.createdAt,
-    }),
-  );
+  const version = args.version ?? 1;
+  const gridSize = args.gridSize ?? 32;
+  const cellSignaturesJson = args.cellSignatures
+    ? JSON.stringify(args.cellSignatures)
+    : null;
+  const watermarkBitsJson = args.watermarkBits
+    ? JSON.stringify(args.watermarkBits)
+    : null;
+
+  const signed = await signCertificateRecordV2({
+    certId: args.certId,
+    sha256: args.sha256,
+    inputSha256: args.inputSha256,
+    sizeBytes: args.sizeBytes,
+    mimeType: args.mimeType,
+    createdAt: args.createdAt,
+    parentCertId: args.parentCertId ?? null,
+    version,
+    similarToCertId: args.similarToCertId ?? null,
+    chunkHashes: args.chunkHashes,
+    imagePhash: args.imagePhash ?? null,
+    width: args.width ?? null,
+    height: args.height ?? null,
+    gridSize,
+    cellSignatures: args.cellSignatures ?? null,
+    watermarkBits: args.watermarkBits ?? null,
+    watermarkVersion: args.watermarkVersion ?? null,
+    textSimhash: args.textSimhash ?? null,
+  });
 
   const recordHash = hashCertificateRecord({
     certId: args.certId,
@@ -202,22 +224,19 @@ async function persistCertificate(args: {
           signature: signed.signature,
           signatureAlg: signed.alg,
           keyId: signed.keyId,
+          signatureVersion: 2,
           chunkHashes: JSON.stringify(args.chunkHashes),
           visibility: args.visibility ?? "LIMITED",
           timestampStatus: "PENDING",
           ownerTokenHash: args.ownerTokenHash,
           parentCertId: args.parentCertId ?? null,
-          version: args.version ?? 1,
+          version,
           width: args.width,
           height: args.height,
           imagePhash: args.imagePhash,
-          gridSize: args.gridSize ?? 32,
-          cellSignatures: args.cellSignatures
-            ? JSON.stringify(args.cellSignatures)
-            : null,
-          watermarkBits: args.watermarkBits
-            ? JSON.stringify(args.watermarkBits)
-            : null,
+          gridSize,
+          cellSignatures: cellSignaturesJson,
+          watermarkBits: watermarkBitsJson,
           watermarkVersion: args.watermarkVersion,
           createdAt: args.createdAt,
         },
@@ -676,6 +695,23 @@ export async function findClosestByPhash(
 export async function checkRecordSignature(
   cert: Certificate,
 ): Promise<boolean> {
+  const version = cert.signatureVersion ?? 1;
+  if (version >= 2) {
+    const payload = payloadFromCertV2(cert);
+    if (cert.keyId) {
+      return verifyCertificateSignatureV2WithKeyId(
+        payload,
+        cert.signature,
+        cert.keyId,
+      );
+    }
+    return verifyCertificateSignatureV2(
+      payload,
+      cert.signature,
+      getEd25519PublicKeyPem(getConfig().ed25519PrivateKey),
+    );
+  }
+
   if (cert.keyId) {
     return verifyCertificateSignatureWithKeyId(
       payloadFromCert(cert),
@@ -708,22 +744,44 @@ export async function openStoredFile(cert: Certificate): Promise<Readable> {
   return storage.get(cert.storagePath);
 }
 
+/**
+ * Read stored original bytes and verify sha256 matches the signed cert.sha256
+ * before any comparison or download uses them.
+ */
+export async function readVerifiedStoredFile(
+  cert: Certificate,
+): Promise<Buffer> {
+  const buf = await readStoredFileBuffer(cert);
+  const hash = sha256Hex(buf);
+  if (hash !== cert.sha256) {
+    console.error(
+      "[stored-file] integrity check failed",
+      { certId: cert.certId, expected: cert.sha256, actual: hash },
+    );
+    throw new AppError(
+      "STORED_FILE_INTEGRITY",
+      "The stored certified original failed its integrity check; this certificate cannot be used for comparison.",
+      409,
+    );
+  }
+  return buf;
+}
+
 export async function streamStoredFileToResponse(
   cert: Certificate,
 ): Promise<Response> {
   await assertRecordIntegrity(cert);
-  const stream = await openStoredFile(cert);
+  const buf = await readVerifiedStoredFile(cert);
   const isImage = Boolean(cert.imagePhash);
   const name = certifiedFilename(cert.originalName, cert.certId, {
     forceExt: isImage ? ".png" : undefined,
   });
-  const webStream = Readable.toWeb(stream) as ReadableStream;
 
-  return new Response(webStream, {
+  return new Response(new Uint8Array(buf), {
     headers: {
       "Content-Type": cert.mimeType || "application/octet-stream",
       "Content-Disposition": `attachment; filename="${name.replace(/"/g, "")}"`,
-      "Content-Length": String(cert.sizeBytes),
+      "Content-Length": String(buf.length),
       "X-Content-SHA256": cert.sha256,
     },
   });

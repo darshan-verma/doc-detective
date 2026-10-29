@@ -11,7 +11,7 @@ import {
   getCertificateByWatermarkToken,
   hashUploadedFile,
   publicCertificateView,
-  readStoredFileBuffer,
+  readVerifiedStoredFile,
 } from "../certificates/service";
 import { explainAnalysis, type PlainLanguageResult } from "../explain";
 import {
@@ -23,6 +23,8 @@ import { getConfig } from "../config";
 import { diffFiles, type DiffResult } from "../diff";
 import { AppError } from "../errors";
 import { parseCertIdFromFilename } from "../filenames";
+import { isLegacySignatureVersion } from "../signing";
+import { checkCertificateRevocation } from "../trust";
 import {
   aspectDiffers,
   cellSignatures,
@@ -95,6 +97,60 @@ export interface VerifyResponse {
   message: string;
   signatureValid?: boolean;
   imageAnalysis?: ImageVerifyAnalysis;
+  /** True when signatureVersion < 2 (analysis fields not covered by signature). */
+  legacyRecord?: boolean;
+}
+
+function legacyFlag(cert: Certificate): boolean {
+  return isLegacySignatureVersion(cert.signatureVersion);
+}
+
+function signatureInvalidResponse(
+  cert: Certificate,
+  uploadedSha256: string,
+): VerifyResponse {
+  return {
+    result: "TAMPERED",
+    uploadedSha256,
+    certId: cert.certId,
+    signatureValid: false,
+    legacyRecord: legacyFlag(cert),
+    message:
+      "Certificate record signature is invalid — the record may have been altered.",
+  };
+}
+
+function storedIntegrityUnavailable(
+  cert: Certificate,
+  uploadedSha256: string,
+  signatureValid: boolean,
+): VerifyResponse {
+  const analysis: AnalysisResult = {
+    verdict: Verdict.ANALYSIS_UNAVAILABLE,
+    confidence: "LOW",
+    checks: [
+      {
+        name: "stored-file-integrity",
+        status: "FAILED",
+        detail:
+          "The stored certified original failed its integrity check; this certificate cannot be used for comparison.",
+      },
+    ],
+    changes: [],
+    notChecked: ["content-comparison"],
+  };
+  return {
+    result: "ANALYSIS_UNAVAILABLE",
+    uploadedSha256,
+    certId: cert.certId,
+    certificate: publicCertificateView(cert),
+    analysis,
+    explanation: explainAnalysis(analysis),
+    signatureValid,
+    legacyRecord: legacyFlag(cert),
+    message:
+      "The stored certified original failed its integrity check; this certificate cannot be used for comparison.",
+  };
 }
 
 function mapAnalysisVerdict(v: Verdict): VerifyResultType {
@@ -132,6 +188,12 @@ async function verifyImageAgainstCert(
 ): Promise<VerifyResponse> {
   const config = getConfig();
   const signatureValid = await checkRecordSignature(cert);
+  if (!signatureValid) {
+    await logVerification(cert.certId, "TAMPERED", uploadedSha256);
+    return signatureInvalidResponse(cert, uploadedSha256);
+  }
+
+  const revocation = await checkCertificateRevocation(cert);
 
   let uploadedPixels;
   try {
@@ -169,6 +231,7 @@ async function verifyImageAgainstCert(
       certId: cert.certId,
       certificate: publicCertificateView(cert),
       signatureValid,
+      legacyRecord: legacyFlag(cert),
       message: "Image dimensions differ from the certified original (aspect ratio changed).",
       imageAnalysis: {
         ...baseAnalysis,
@@ -203,7 +266,7 @@ async function verifyImageAgainstCert(
   } else {
     // Fallback: recompute from stored certified file
     try {
-      const stored = await readStoredFileBuffer(cert);
+      const stored = await readVerifiedStoredFile(cert);
       storedPixelsForPixelStage = await decodeImage(stored);
       const recomputed = cellSignatures(storedPixelsForPixelStage, gridSize);
       comparison = compareCells(recomputed, uploadCells, gridSize, {
@@ -213,6 +276,10 @@ async function verifyImageAgainstCert(
         outlierAbsFloor: config.outlierAbsFloor,
       });
     } catch (err) {
+      if (err instanceof AppError && err.code === "STORED_FILE_INTEGRITY") {
+        await logVerification(cert.certId, "ANALYSIS_UNAVAILABLE", uploadedSha256);
+        return storedIntegrityUnavailable(cert, uploadedSha256, signatureValid);
+      }
       console.error("[verifyImageAgainstCert] stored decode failed", err);
       const analysis: AnalysisResult = {
         verdict: Verdict.ANALYSIS_UNAVAILABLE,
@@ -236,6 +303,7 @@ async function verifyImageAgainstCert(
         analysis,
         explanation: explainAnalysis(analysis),
         signatureValid,
+        legacyRecord: legacyFlag(cert),
         message:
           "Matched an image certificate, but could not decode the stored certified file for comparison.",
         imageAnalysis: {
@@ -282,7 +350,7 @@ async function verifyImageAgainstCert(
   if (classified.classification !== "TAMPERED") {
     try {
       if (!storedPixelsForPixelStage) {
-        const stored = await readStoredFileBuffer(cert);
+        const stored = await readVerifiedStoredFile(cert);
         storedPixelsForPixelStage = await decodeImage(stored);
         if (
           storedPixelsForPixelStage.width !== origW ||
@@ -316,9 +384,28 @@ async function verifyImageAgainstCert(
         analysis.reason = `${classified.reason}; ${pixel.reason}`;
       }
     } catch (err) {
+      if (err instanceof AppError && err.code === "STORED_FILE_INTEGRITY") {
+        await logVerification(cert.certId, "ANALYSIS_UNAVAILABLE", uploadedSha256);
+        return storedIntegrityUnavailable(cert, uploadedSha256, signatureValid);
+      }
       console.error("[verifyImageAgainstCert] pixel stage failed", err);
       analysis.reason = `${classified.reason}; pixel stage unavailable (stored file unreadable)`;
     }
+  }
+
+  if (revocation.revoked) {
+    await logVerification(cert.certId, "REVOKED", uploadedSha256);
+    return {
+      result: "REVOKED",
+      uploadedSha256,
+      certId: cert.certId,
+      certificate: publicCertificateView(cert),
+      signatureValid,
+      legacyRecord: legacyFlag(cert),
+      message:
+        "Certificate has been revoked. Do not treat this file as currently certified.",
+      imageAnalysis: analysis,
+    };
   }
 
   if (classified.classification === "TAMPERED") {
@@ -329,6 +416,7 @@ async function verifyImageAgainstCert(
       certId: cert.certId,
       certificate: publicCertificateView(cert),
       signatureValid,
+      legacyRecord: legacyFlag(cert),
       message: `Image has been tampered with. ${comparison.changedCells.length} cell(s) differ (${comparison.changedPercent.toFixed(1)}% of grid). ${classified.reason}`,
       imageAnalysis: analysis,
     };
@@ -342,6 +430,7 @@ async function verifyImageAgainstCert(
       certId: cert.certId,
       certificate: publicCertificateView(cert),
       signatureValid,
+      legacyRecord: legacyFlag(cert),
       message:
         "Whole-image adjustment detected (brightness/contrast/filter). Not considered content tampering.",
       imageAnalysis: analysis,
@@ -356,6 +445,7 @@ async function verifyImageAgainstCert(
     certId: cert.certId,
     certificate: publicCertificateView(cert),
     signatureValid,
+    legacyRecord: legacyFlag(cert),
     message:
       "Image matches the certified visual content (re-encoded or lightly processed). Not considered tampered.",
     imageAnalysis: analysis,
@@ -440,31 +530,11 @@ export async function verifyUpload(
     const signatureValid = await checkRecordSignature(byHash);
     if (!signatureValid) {
       await logVerification(byHash.certId, "TAMPERED", uploadedSha256);
-      return {
-        result: "TAMPERED",
-        uploadedSha256,
-        certId: byHash.certId,
-        signatureValid: false,
-        message:
-          "File hash matches a certificate, but the certificate record signature is invalid — the record may have been altered.",
-        imageAnalysis: byHash.imagePhash
-          ? {
-              watermark: { found: false, confidence: 0 },
-              visualDistance: 0,
-              tamperScore: 0,
-              changedPercent: 0,
-              changedRegions: 0,
-              changedCells: [],
-              gridSize: byHash.gridSize,
-              width: byHash.width ?? 0,
-              height: byHash.height ?? 0,
-              matchedBy: "sha256",
-            }
-          : undefined,
-      };
+      return signatureInvalidResponse(byHash, uploadedSha256);
     }
 
-    if (byHash.revokedAt) {
+    const revocation = await checkCertificateRevocation(byHash);
+    if (revocation.revoked) {
       await logVerification(byHash.certId, "REVOKED", uploadedSha256);
       const analysis: AnalysisResult = {
         verdict: Verdict.AUTHENTIC,
@@ -481,6 +551,7 @@ export async function verifyUpload(
         analysis,
         explanation: explainAnalysis(analysis, { revoked: true }),
         signatureValid: true,
+        legacyRecord: legacyFlag(byHash),
         message:
           "Certificate has been revoked. Bytes match, but this certificate is no longer valid.",
       };
@@ -538,6 +609,7 @@ export async function verifyUpload(
       explanation: explainAnalysis(analysis),
       newerVersion,
       signatureValid: true,
+      legacyRecord: legacyFlag(byHash),
       message: newerVersion
         ? `File is authentic for this version, but a newer version exists (${newerVersion.certId}).`
         : "File is authentic. Content hash matches the certified original.",
@@ -605,15 +677,10 @@ export async function verifyUpload(
       const signatureValid = await checkRecordSignature(cert);
       if (!signatureValid) {
         await logVerification(cert.certId, "TAMPERED", uploadedSha256);
-        return {
-          result: "TAMPERED",
-          uploadedSha256,
-          certId: cert.certId,
-          signatureValid: false,
-          message:
-            "Certificate record signature is invalid — the record may have been altered.",
-        };
+        return signatureInvalidResponse(cert, uploadedSha256);
       }
+
+      const revocation = await checkCertificateRevocation(cert);
 
       // If the matched cert is an image cert but upload wasn't detected as image,
       // still try image analysis when possible
@@ -626,12 +693,34 @@ export async function verifyUpload(
             "certId",
             { found: false, confidence: 0 },
           );
-        } catch {
+        } catch (err) {
+          if (err instanceof AppError && err.code === "STORED_FILE_INTEGRITY") {
+            await logVerification(
+              cert.certId,
+              "ANALYSIS_UNAVAILABLE",
+              uploadedSha256,
+            );
+            return storedIntegrityUnavailable(cert, uploadedSha256, true);
+          }
           // fall through to binary/text diff
         }
       }
 
-      const originalBuf = await readStoredFileBuffer(cert);
+      let originalBuf: Buffer;
+      try {
+        originalBuf = await readVerifiedStoredFile(cert);
+      } catch (err) {
+        if (err instanceof AppError && err.code === "STORED_FILE_INTEGRITY") {
+          await logVerification(
+            cert.certId,
+            "ANALYSIS_UNAVAILABLE",
+            uploadedSha256,
+          );
+          return storedIntegrityUnavailable(cert, uploadedSha256, true);
+        }
+        throw err;
+      }
+
       let chunkHashes: string[] | undefined;
       try {
         chunkHashes = JSON.parse(cert.chunkHashes) as string[];
@@ -654,7 +743,7 @@ export async function verifyUpload(
         chunkHashes,
       });
 
-      if (cert.revokedAt) {
+      if (revocation.revoked) {
         await logVerification(cert.certId, "REVOKED", uploadedSha256);
         return {
           result: "REVOKED",
@@ -664,6 +753,7 @@ export async function verifyUpload(
           analysis,
           explanation: explainAnalysis(analysis, { revoked: true }),
           signatureValid: true,
+          legacyRecord: legacyFlag(cert),
           message:
             "Certificate has been revoked. Do not treat this file as currently certified.",
         };
@@ -686,6 +776,7 @@ export async function verifyUpload(
         explanation: explainAnalysis(analysis),
         newerVersion,
         signatureValid: true,
+        legacyRecord: legacyFlag(cert),
         message: messageForAnalysis(analysis),
       };
     }

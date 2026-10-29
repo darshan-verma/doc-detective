@@ -43,5 +43,7 @@ export function publicCertificateView(cert: Certificate) {
     revokedAt: cert.revokedAt?.toISOString() ?? null,
     revokeReason: cert.revokeReason,
     supersededBy: cert.supersededBy,
+    signatureVersion: cert.signatureVersion ?? 1,
+    legacyRecord: (cert.signatureVersion ?? 1) < 2,
   };
 }

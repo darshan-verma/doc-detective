@@ -23,9 +23,11 @@ export {
   verifyLogChain,
   computeEntryHash,
   hashCertificateRecord,
+  hashRevokeRecord,
+  checkCertificateRevocation,
   GENESIS_PREV_HASH,
 } from "./log";
-export type { LogEventType, ChainVerifyResult } from "./log";
+export type { LogEventType, ChainVerifyResult, RevocationLogCheck } from "./log";
 
 export {
   buildMerkleTree,

@@ -55,6 +55,108 @@ export function hashCertificateRecord(fields: {
     .digest("hex");
 }
 
+/** Domain-separated hash bound to the revocation event itself (not the creation record). */
+export function hashRevokeRecord(fields: {
+  certId: string;
+  revokedAt: Date | string;
+  reason: string;
+}): string {
+  const revokedAt =
+    fields.revokedAt instanceof Date
+      ? fields.revokedAt.toISOString()
+      : new Date(fields.revokedAt).toISOString();
+  const reasonHash = createHash("sha256")
+    .update(fields.reason, "utf8")
+    .digest("hex");
+  return createHash("sha256")
+    .update(`doc-detective/revoke/v1\n${fields.certId}|${revokedAt}|${reasonHash}`)
+    .digest("hex");
+}
+
+export interface RevocationLogCheck {
+  revoked: boolean;
+  /** True when a valid CERTIFICATE_REVOKED log entry was found. */
+  fromLog: boolean;
+  /** True when Certificate.revokedAt is set. */
+  fromColumn: boolean;
+}
+
+/**
+ * Revocation status from the transparency log (primary) and column (secondary).
+ * A cert is revoked if a CERTIFICATE_REVOKED entry has a recomputed entryHash
+ * and a recordHash matching hashRevokeRecord for that event.
+ */
+export async function checkCertificateRevocation(cert: {
+  certId: string;
+  revokedAt: Date | null;
+  revokeReason: string | null;
+}): Promise<RevocationLogCheck> {
+  const fromColumn = Boolean(cert.revokedAt);
+  const entries = await prisma.logEntry.findMany({
+    where: { certId: cert.certId, eventType: "CERTIFICATE_REVOKED" },
+    orderBy: { seq: "asc" },
+  });
+
+  let fromLog = false;
+  for (const entry of entries) {
+    const recomputed = computeEntryHash({
+      seq: entry.seq,
+      prevHash: entry.prevHash,
+      recordHash: entry.recordHash,
+      createdAt: entry.createdAt,
+    });
+    if (recomputed !== entry.entryHash) continue;
+
+    let revokedAt: Date | null = null;
+    let reason = "";
+    if (entry.details) {
+      try {
+        const d = JSON.parse(entry.details) as {
+          revokedAt?: string;
+          reason?: string;
+        };
+        if (d.revokedAt) revokedAt = new Date(d.revokedAt);
+        reason = d.reason ?? "";
+      } catch {
+        /* fall through */
+      }
+    }
+    if (!revokedAt && cert.revokedAt) {
+      revokedAt = cert.revokedAt;
+      reason = cert.revokeReason ?? "";
+    }
+    if (!revokedAt) continue;
+
+    const expected = hashRevokeRecord({
+      certId: cert.certId,
+      revokedAt,
+      reason,
+    });
+    if (expected === entry.recordHash) {
+      fromLog = true;
+      break;
+    }
+  }
+
+  if (fromLog !== fromColumn) {
+    console.error(
+      "[revoke] column and transparency log disagree",
+      {
+        certId: cert.certId,
+        fromLog,
+        fromColumn,
+        revokedAt: cert.revokedAt?.toISOString() ?? null,
+      },
+    );
+  }
+
+  return {
+    revoked: fromLog || fromColumn,
+    fromLog,
+    fromColumn,
+  };
+}
+
 async function appendInside(
   tx: Prisma.TransactionClient,
   input: AppendLogInput,

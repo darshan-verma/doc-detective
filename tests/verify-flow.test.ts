@@ -5,10 +5,15 @@ import path from "path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
 import { resetConfigCache } from "../src/lib/config";
-import { LocalDiskStorage, setStorage } from "../src/lib/storage";
-import { certifyUpload } from "../src/lib/certificates/service";
+import { LocalDiskStorage, getStorage, setStorage } from "../src/lib/storage";
+import {
+  certifyUpload,
+  streamStoredFileToResponse,
+} from "../src/lib/certificates/service";
+import { revokeCertificate } from "../src/lib/certificates/ownership";
 import { verifyUpload } from "../src/lib/verify/service";
 import { resetSigningKeyCache } from "../src/lib/signing";
+import { AppError } from "../src/lib/errors";
 
 const prisma = new PrismaClient();
 let storageDir: string;
@@ -109,5 +114,83 @@ describe("verify flows", () => {
     );
     expect(result.result).toBe("TAMPERED");
     expect(result.signatureValid).toBe(false);
+  });
+
+  it("edit cellSignatures in DB → signature-invalid TAMPERED", async () => {
+    const file = makeFile("cells-guard", "c.txt");
+    const certified = await certifyUpload(file);
+    const cert = await prisma.certificate.findUniqueOrThrow({
+      where: { certId: certified.certId },
+    });
+    expect(cert.signatureVersion).toBe(2);
+
+    await prisma.certificate.update({
+      where: { id: cert.id },
+      data: {
+        cellSignatures: JSON.stringify([
+          { dHash: "deadbeef", meanLuma: 99 },
+        ]),
+      },
+    });
+
+    const result = await verifyUpload(
+      makeFile("cells-guard", "c.txt"),
+      certified.certId,
+    );
+    expect(result.result).toBe("TAMPERED");
+    expect(result.signatureValid).toBe(false);
+    expect(result.result).not.toBe("MODIFIED_REENCODED");
+  });
+
+  it("replaced stored original + upload edited → ANALYSIS_UNAVAILABLE", async () => {
+    const original = makeFile("original-bytes-v1", "o.txt");
+    const certified = await certifyUpload(original);
+    const cert = await prisma.certificate.findUniqueOrThrow({
+      where: { certId: certified.certId },
+    });
+
+    const edited = Buffer.from("edited-bytes-forged");
+    await getStorage().put(cert.storagePath, edited);
+
+    const result = await verifyUpload(
+      makeFile(edited, "o.txt"),
+      certified.certId,
+    );
+    expect(result.result).not.toBe("AUTHENTIC");
+    expect(result.result).toBe("ANALYSIS_UNAVAILABLE");
+    expect(result.message).toContain(
+      "stored certified original failed its integrity check",
+    );
+  });
+
+  it("revoke then clear revokedAt → still REVOKED from log", async () => {
+    const file = makeFile("revoke-me", "r.txt");
+    const certified = await certifyUpload(file);
+    await revokeCertificate(certified.certId, certified.ownerToken, "test revoke");
+
+    await prisma.certificate.update({
+      where: { certId: certified.certId },
+      data: { revokedAt: null, revokeReason: null },
+    });
+
+    const result = await verifyUpload(
+      makeFile("revoke-me", "r.txt"),
+      null,
+    );
+    expect(result.result).toBe("REVOKED");
+  });
+
+  it("download of cert whose stored bytes were altered → 409", async () => {
+    const file = makeFile("download-guard", "d.txt");
+    const certified = await certifyUpload(file);
+    const cert = await prisma.certificate.findUniqueOrThrow({
+      where: { certId: certified.certId },
+    });
+    await getStorage().put(cert.storagePath, Buffer.from("tampered-stored"));
+
+    await expect(streamStoredFileToResponse(cert)).rejects.toMatchObject({
+      code: "STORED_FILE_INTEGRITY",
+      status: 409,
+    } satisfies Partial<AppError>);
   });
 });

@@ -28,6 +28,7 @@ export function CertificatePanel({
   signatureValid,
   registeredSha256,
   uploadedSha256,
+  legacyRecord,
 }: {
   certId: string;
   createdAt: string;
@@ -35,10 +36,16 @@ export function CertificatePanel({
   signatureValid?: boolean;
   registeredSha256: string;
   uploadedSha256: string;
+  legacyRecord?: boolean;
 }) {
   return (
     <div className="space-y-3 rounded-lg border border-zinc-200 bg-white p-4 text-sm">
       <h3 className="font-semibold text-zinc-900">Certificate</h3>
+      {legacyRecord && (
+        <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
+          Older certificate: analysis data is not covered by the signature.
+        </p>
+      )}
       <dl className="space-y-2.5">
         <div className="flex flex-wrap items-center gap-2">
           <dt className="w-36 shrink-0 text-xs text-zinc-500">Certificate ID</dt>

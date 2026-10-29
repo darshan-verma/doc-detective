@@ -5,6 +5,7 @@ export type ErrorCode =
   | "NOT_FOUND"
   | "RATE_LIMITED"
   | "SIGNATURE_INVALID"
+  | "STORED_FILE_INTEGRITY"
   | "SIMILAR_CERTIFICATE_EXISTS"
   | "INTERNAL";
 

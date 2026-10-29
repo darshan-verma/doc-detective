@@ -27,6 +27,8 @@ model Certificate {
   signature        String
   signatureAlg     String    @default("ed25519")
   keyId            String    @default("local-dev")
+  /// 1 = legacy narrow payload; 2 = covers all verification inputs.
+  signatureVersion Int       @default(1)
   chunkHashes      String // JSON array of per-4KB SHA-256 hashes
   // Image certification fields (null for non-image certificates)
   width            Int?
@@ -82,6 +84,7 @@ model LogEntry {
   createdAt  DateTime @default(now())
 
   @@index([certId])
+  @@index([certId, eventType])
   @@index([createdAt])
 }
 

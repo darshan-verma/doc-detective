@@ -47,6 +47,7 @@ interface VerifyResponse {
   certId?: string;
   message: string;
   signatureValid?: boolean;
+  legacyRecord?: boolean;
   diff?: DiffResult;
   imageAnalysis?: ImageAnalysis;
   explanation?: Explanation;
@@ -83,6 +84,7 @@ interface VerifyResponse {
     protectionMethods?: string[];
     signatureAlg?: string;
     timestampStatus?: string;
+    legacyRecord?: boolean;
   };
 }
 
@@ -416,6 +418,12 @@ function VerifyInner() {
             </div>
           )}
 
+          {(result.legacyRecord || result.certificate?.legacyRecord) && (
+            <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+              Older certificate: analysis data is not covered by the signature.
+            </div>
+          )}
+
           {/* Certificate + changes first so the diff is visible with cert context */}
           {result.imageAnalysis && uploadedFile ? (
             <ImageVerifyView
@@ -436,6 +444,9 @@ function VerifyInner() {
                   signatureValid={result.signatureValid}
                   registeredSha256={result.certificate.sha256}
                   uploadedSha256={result.uploadedSha256}
+                  legacyRecord={
+                    result.legacyRecord || result.certificate.legacyRecord
+                  }
                 />
               )}
               {!result.certificate && (

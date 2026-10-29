@@ -79,6 +79,11 @@ export default async function CertificatePage({
             REVOKED{view.revokeReason ? `: ${view.revokeReason}` : ""}
           </p>
         )}
+        {view.legacyRecord && (
+          <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+            Older certificate: analysis data is not covered by the signature.
+          </p>
+        )}
       </div>
 
       <CertificateQr certId={view.certId} />

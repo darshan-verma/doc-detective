@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "crypto";
 import type { Certificate } from "@prisma/client";
 import { prisma } from "../prisma";
 import { AppError } from "../errors";
-import { appendLogEntry, hashCertificateRecord } from "../trust";
+import { appendLogEntry, hashRevokeRecord } from "../trust";
 
 export function hashOwnerToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
@@ -38,24 +38,26 @@ export async function revokeCertificate(
     throw new AppError("BAD_REQUEST", "Certificate already revoked", 400);
   }
   const revokedAt = new Date();
+  const reasonTrimmed = reason.slice(0, 500);
   await prisma.$transaction(async (tx) => {
     await tx.certificate.update({
       where: { certId },
-      data: { revokedAt, revokeReason: reason.slice(0, 500) },
+      data: { revokedAt, revokeReason: reasonTrimmed },
     });
     await appendLogEntry(
       {
         certId,
         eventType: "CERTIFICATE_REVOKED",
-        recordHash: hashCertificateRecord({
+        recordHash: hashRevokeRecord({
           certId: cert.certId,
-          sha256: cert.sha256,
-          sizeBytes: cert.sizeBytes,
-          keyId: cert.keyId,
-          signature: cert.signature,
-          createdAt: cert.createdAt,
+          revokedAt,
+          reason: reasonTrimmed,
         }),
         createdAt: revokedAt,
+        details: {
+          revokedAt: revokedAt.toISOString(),
+          reason: reasonTrimmed,
+        },
       },
       tx,
     );
