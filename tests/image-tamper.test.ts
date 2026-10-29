@@ -5,8 +5,9 @@
  * - CELL_STRONG_HAMMING=48, CELL_STRONG_LUMA=40
  * - OUTLIER_K=6, OUTLIER_ABS_FLOOR=0.15, MAD floor 0.02 — JPEG q70 stays under
  *   the outlier bar; MAD=0 uniform shifts no longer flood outliers.
- * - PIXEL_MIN_REGION_AREA=80 at 1024²; pixel absFloor=12; mask-fraction gate 10%
- *   — catches 24–32px erasures and +15 copy-regions without JPEG/resize FPs.
+ * - PIXEL_MIN_REGION_AREA=80 at 1024²; pixel absFloor=3.5 on the normalised map;
+ *   photometric align + 3×3 resample min + 32×32 tile norm (maskFraction diagnostic
+ *   only; mid-strength + high mask → resample, not bail-before-components).
  * - TAMPER_MIN_CLUSTER_CELLS=2, GLOBAL_CHANGE_MIN_PERCENT=60
  *
  * Tune K / floors (not these assertions) if a case fails.
@@ -24,6 +25,7 @@ import {
   decodeImage,
   detectLocalizedPixelTamper,
   encodeJpeg,
+  resizePixels,
 } from "../src/lib/image";
 import type { PixelBuffer } from "../src/lib/image/pixels";
 import type { ImageChangeClass } from "../src/lib/image";
@@ -113,10 +115,7 @@ async function fullVerdict(
   if (cell.classification === "TAMPERED") {
     return { classification: "TAMPERED", via: "cell" };
   }
-  // Match verifyImageAgainstCert: skip pixel stage on GLOBAL_ADJUSTMENT.
-  if (cell.classification === "GLOBAL_ADJUSTMENT") {
-    return { classification: cell.classification, via: "cell" };
-  }
+  // Always run pixel stage unless cells already said TAMPERED (incl. GLOBAL_ADJUSTMENT).
   const pixel = await detectLocalizedPixelTamper(orig, next, {
     minRegionArea: cfg().pixelMinRegionArea,
     outlierK: cfg().outlierK,
@@ -158,8 +157,7 @@ async function harshTextPage(size = 1024): Promise<PixelBuffer> {
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const i = (y * size + x) * 3;
-      const dark =
-        y % 40 < 12 && ((x * 7 + y * 3) % 23) < 14;
+      const dark = y % 40 < 12 && ((x * 7 + y * 3) % 23) < 14;
       const v = dark ? 30 : 245;
       raw[i] = v;
       raw[i + 1] = v;
@@ -180,7 +178,7 @@ async function photoLike(size = 1024, seed = 42): Promise<PixelBuffer> {
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       const i = (y * size + x) * 3;
-      const noise = (rand() * 20) - 10;
+      const noise = rand() * 20 - 10;
       const v = Math.max(
         0,
         Math.min(
@@ -191,6 +189,33 @@ async function photoLike(size = 1024, seed = 42): Promise<PixelBuffer> {
       raw[i] = v;
       raw[i + 1] = v * 0.9;
       raw[i + 2] = v * 0.8;
+    }
+  }
+  return fromRgb(raw, size);
+}
+
+/**
+ * Receipt-like: white 250 page, 20 lines of 14×22 glyphs at
+ * x=80+g*21, y=60+line*45; strokes (x-x0)%7<3 || (y-y0)%11<3 → 25.
+ */
+async function receiptLike(size = 1024): Promise<PixelBuffer> {
+  const raw = Buffer.alloc(size * size * 3, 250);
+  for (let line = 0; line < 20; line++) {
+    const y0 = 60 + line * 45;
+    if (y0 + 22 > size) break;
+    for (let g = 0; ; g++) {
+      const x0 = 80 + g * 21;
+      if (x0 + 14 > size - 40) break;
+      for (let y = 0; y < 22; y++) {
+        for (let x = 0; x < 14; x++) {
+          if (x % 7 < 3 || y % 11 < 3) {
+            const i = ((y0 + y) * size + (x0 + x)) * 3;
+            raw[i] = 25;
+            raw[i + 1] = 25;
+            raw[i + 2] = 25;
+          }
+        }
+      }
     }
   }
   return fromRgb(raw, size);
@@ -229,6 +254,53 @@ function addBrightness(pixels: PixelBuffer, delta: number): PixelBuffer {
     out.data[i] = Math.max(0, Math.min(255, out.data[i]! + delta));
     out.data[i + 1] = Math.max(0, Math.min(255, out.data[i + 1]! + delta));
     out.data[i + 2] = Math.max(0, Math.min(255, out.data[i + 2]! + delta));
+  }
+  return out;
+}
+
+function adjustContrast(pixels: PixelBuffer, factor: number): PixelBuffer {
+  const out: PixelBuffer = {
+    data: new Uint8ClampedArray(pixels.data),
+    width: pixels.width,
+    height: pixels.height,
+  };
+  for (let i = 0; i < out.data.length; i += 4) {
+    out.data[i] = Math.max(
+      0,
+      Math.min(255, Math.round((out.data[i]! - 128) * factor + 128)),
+    );
+    out.data[i + 1] = Math.max(
+      0,
+      Math.min(255, Math.round((out.data[i + 1]! - 128) * factor + 128)),
+    );
+    out.data[i + 2] = Math.max(
+      0,
+      Math.min(255, Math.round((out.data[i + 2]! - 128) * factor + 128)),
+    );
+  }
+  return out;
+}
+
+/** Brighten a square region by +delta luma (clamped). */
+function brightenRegion(
+  pixels: PixelBuffer,
+  x0: number,
+  y0: number,
+  size: number,
+  delta: number,
+): PixelBuffer {
+  const out: PixelBuffer = {
+    data: new Uint8ClampedArray(pixels.data),
+    width: pixels.width,
+    height: pixels.height,
+  };
+  for (let y = y0; y < y0 + size && y < out.height; y++) {
+    for (let x = x0; x < x0 + size && x < out.width; x++) {
+      const i = (y * out.width + x) * 4;
+      out.data[i] = Math.min(255, out.data[i]! + delta);
+      out.data[i + 1] = Math.min(255, out.data[i + 1]! + delta);
+      out.data[i + 2] = Math.min(255, out.data[i + 2]! + delta);
+    }
   }
   return out;
 }
@@ -281,13 +353,41 @@ async function resize50ThenUp(orig: PixelBuffer): Promise<PixelBuffer> {
   };
 }
 
+/** Resize to scale, JPEG encode, decode, then resize back to original (verify path). */
+async function resizeThenJpegBack(
+  orig: PixelBuffer,
+  scaleOrLongSide: number,
+  quality: number,
+  mode: "scale" | "longSide",
+): Promise<PixelBuffer> {
+  let tw: number;
+  let th: number;
+  if (mode === "scale") {
+    tw = Math.max(1, Math.round(orig.width * scaleOrLongSide));
+    th = Math.max(1, Math.round(orig.height * scaleOrLongSide));
+  } else {
+    const long = Math.max(orig.width, orig.height);
+    const s = scaleOrLongSide / long;
+    tw = Math.max(1, Math.round(orig.width * s));
+    th = Math.max(1, Math.round(orig.height * s));
+  }
+  const small = await sharp(Buffer.from(orig.data), {
+    raw: { width: orig.width, height: orig.height, channels: 4 },
+  })
+    .resize(tw, th, { fit: "fill" })
+    .jpeg({ quality, chromaSubsampling: "4:2:0" })
+    .toBuffer();
+  const decoded = await decodeImage(small);
+  return resizePixels(decoded, orig.width, orig.height);
+}
+
 const SOURCES: Array<{
   name: string;
   build: () => Promise<PixelBuffer>;
 }> = [
   { name: "smooth", build: () => smoothDocument(1024) },
-  { name: "harsh-text", build: () => harshTextPage(1024) },
   { name: "photo", build: () => photoLike(1024) },
+  { name: "receipt", build: () => receiptLike(1024) },
 ];
 
 describe("config defaults (zod SSOT)", () => {
@@ -301,8 +401,8 @@ describe("config defaults (zod SSOT)", () => {
   });
 });
 
-describe.each(SOURCES)("tamper pipeline — $name", ({ build }) => {
-  it.each([95, 85, 70])(
+describe.each(SOURCES)("benign transforms — $name", ({ build }) => {
+  it.each([90, 75, 60])(
     "JPEG q%i re-encode → NOT TAMPERED",
     async (q) => {
       const orig = await build();
@@ -312,10 +412,17 @@ describe.each(SOURCES)("tamper pipeline — $name", ({ build }) => {
     },
   );
 
-  it("50% down + up resize → NOT TAMPERED", async () => {
+  it("70% resize + JPEG q85 → NOT TAMPERED", async () => {
     const orig = await build();
-    const back = await resize50ThenUp(orig);
-    const { classification } = await fullVerdict(orig, back);
+    const next = await resizeThenJpegBack(orig, 0.7, 85, "scale");
+    const { classification } = await fullVerdict(orig, next);
+    expect(classification).not.toBe("TAMPERED");
+  });
+
+  it("800px long-side + JPEG q70 → NOT TAMPERED", async () => {
+    const orig = await build();
+    const next = await resizeThenJpegBack(orig, 800, 70, "longSide");
+    const { classification } = await fullVerdict(orig, next);
     expect(classification).not.toBe("TAMPERED");
   });
 
@@ -326,6 +433,15 @@ describe.each(SOURCES)("tamper pipeline — $name", ({ build }) => {
     expect(classification).not.toBe("TAMPERED");
   });
 
+  it("contrast 1.2× → NOT TAMPERED", async () => {
+    const orig = await build();
+    const next = adjustContrast(orig, 1.2);
+    const { classification } = await fullVerdict(orig, next);
+    expect(classification).not.toBe("TAMPERED");
+  });
+});
+
+describe.each(SOURCES)("obvious block edits — $name", ({ build }) => {
   it.each([64, 128, 192, 320])(
     "block overwrite %ipx → TAMPERED",
     async (block) => {
@@ -341,6 +457,51 @@ describe.each(SOURCES)("tamper pipeline — $name", ({ build }) => {
     const edited = copyRegionBrighten(orig, 100, 100, 500, 500, 128, 15);
     const jpeg = await decodeImage(await encodeJpeg(edited, 80));
     const { classification } = await fullVerdict(orig, jpeg);
+    expect(classification).toBe("TAMPERED");
+  });
+
+  it("50% down + up resize → NOT TAMPERED", async () => {
+    const orig = await build();
+    const back = await resize50ThenUp(orig);
+    const { classification } = await fullVerdict(orig, back);
+    expect(classification).not.toBe("TAMPERED");
+  });
+});
+
+describe("photo localized luma + JPEG (GLOBAL_ADJUSTMENT hole)", () => {
+  it.each([
+    { size: 24, delta: 30 },
+    { size: 40, delta: 25 },
+    { size: 60, delta: 20 },
+  ])(
+    "$size px region +$delta then JPEG q75 → TAMPERED",
+    async ({ size, delta }) => {
+      const orig = await photoLike(1024);
+      const edited = brightenRegion(orig, 200, 200, size, delta);
+      const jpeg = await decodeImage(await encodeJpeg(edited, 75));
+      const { classification } = await fullVerdict(orig, jpeg);
+      expect(classification).toBe("TAMPERED");
+    },
+  );
+});
+
+describe("receipt glyph erase after global adjust", () => {
+  it.each([20, 30])(
+    "brightness +%i then erase glyph 20×20 @ (416,378) → TAMPERED",
+    async (delta) => {
+      const orig = await receiptLike(1024);
+      const bright = addBrightness(orig, delta);
+      const erased = overwriteBlock(bright, 416, 378, 20, [255, 255, 255]);
+      const { classification } = await fullVerdict(orig, erased);
+      expect(classification).toBe("TAMPERED");
+    },
+  );
+
+  it("contrast 1.2× then erase glyph → TAMPERED", async () => {
+    const orig = await receiptLike(1024);
+    const contrasted = adjustContrast(orig, 1.2);
+    const erased = overwriteBlock(contrasted, 416, 378, 20, [255, 255, 255]);
+    const { classification } = await fullVerdict(orig, erased);
     expect(classification).toBe("TAMPERED");
   });
 });

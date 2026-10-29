@@ -275,13 +275,11 @@ async function verifyImageAgainstCert(
       : undefined,
   };
 
-  // Pixel second stage: catch sub-cell edits when cell classifier is soft.
-  // Skip GLOBAL_ADJUSTMENT — whole-image shift/noise already decided; pixel
-  // absdiff would light up stripe/resample bands as false "regions".
-  if (
-    classified.classification !== "TAMPERED" &&
-    classified.classification !== "GLOBAL_ADJUSTMENT"
-  ) {
+  // Pixel second stage: catch sub-cell / JPEG-softened edits the cell
+  // classifier labels GLOBAL_ADJUSTMENT or REENCODED. Photometric alignment
+  // + tile normalisation in detectLocalizedPixelTamper absorb global shifts;
+  // only skip when cells already decided TAMPERED.
+  if (classified.classification !== "TAMPERED") {
     try {
       if (!storedPixelsForPixelStage) {
         const stored = await readStoredFileBuffer(cert);
