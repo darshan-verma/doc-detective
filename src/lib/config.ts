@@ -1,4 +1,36 @@
+import { createPrivateKey, createPublicKey } from "crypto";
 import { z } from "zod";
+
+/**
+ * PKCS8 body of the old committed example key. Production must not use a key
+ * whose public key matches this material.
+ */
+const EXAMPLE_ED25519_PKCS8_B64 =
+  "MC4CAQAwBQYDK2VwBCIEILSEi4GERcJZPSR6zKIGi7uDvsuILLlPf++AU+f/MiFY";
+
+function publicKeyDerFromPrivatePemOrB64(raw: string): Buffer {
+  const trimmed = raw.trim().replace(/\\n/g, "\n");
+  const priv = trimmed.includes("BEGIN")
+    ? createPrivateKey(trimmed)
+    : createPrivateKey({
+        key: Buffer.from(trimmed, "base64"),
+        format: "der",
+        type: "pkcs8",
+      });
+  return createPublicKey(priv).export({ type: "spki", format: "der" }) as Buffer;
+}
+
+function isExampleSigningKey(privateKeyMaterial: string): boolean {
+  try {
+    const configured = publicKeyDerFromPrivatePemOrB64(privateKeyMaterial);
+    const example = publicKeyDerFromPrivatePemOrB64(EXAMPLE_ED25519_PKCS8_B64);
+    return (
+      configured.length === example.length && configured.equals(example)
+    );
+  } catch {
+    return false;
+  }
+}
 
 const envSchema = z.object({
   ED25519_PRIVATE_KEY: z.string().min(32, "ED25519_PRIVATE_KEY is required"),
@@ -131,6 +163,14 @@ let cached: AppConfig | null = null;
 export function getConfig(): AppConfig {
   if (!cached) {
     cached = loadConfig();
+    if (isExampleSigningKey(cached.ed25519PrivateKey)) {
+      const msg =
+        "ED25519_PRIVATE_KEY matches the old public example key — generate a unique key before deploying.";
+      if (process.env.NODE_ENV === "production") {
+        throw new Error(msg);
+      }
+      console.warn(`\n⚠️  WARNING: ${msg}\n`);
+    }
   }
   return cached;
 }

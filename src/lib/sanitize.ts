@@ -1,18 +1,13 @@
 /**
  * Strip private-use and control characters from text for UI and PDF report display.
  * Keeps newlines and tabs; removes U+E000–U+F8FF (e.g. Wingdings U+F0B7) and C0/C1 controls.
+ * Unicode punctuation (arrows, dashes, curly quotes, ellipsis) is preserved — the PDF
+ * report embeds Noto Sans.
  */
 export function sanitizeForDisplay(text: string): string {
   if (!text) return text;
   return (
     text
-      // Common Unicode that WinAnsi/Helvetica cannot encode
-      .replace(/\u2192/g, "->") // →
-      .replace(/\u2190/g, "<-") // ←
-      .replace(/\u2013|\u2014/g, "-") // en/em dash
-      .replace(/\u2018|\u2019/g, "'")
-      .replace(/\u201C|\u201D/g, '"')
-      .replace(/\u2026/g, "...")
       .replace(/\u00A0/g, " ")
       .replace(
         // eslint-disable-next-line no-control-regex
