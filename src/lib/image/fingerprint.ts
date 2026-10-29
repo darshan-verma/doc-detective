@@ -28,11 +28,17 @@ export interface ChangedCellCluster {
 
 export interface CellCompareResult {
   changedCells: Array<{ x: number; y: number }>;
-  /** Per-changed-cell detail (same order as changedCells). */
+  /** Per-changed-cell detail (weak threshold; UI / legacy). */
   cellDetails: ChangedCellDetail[];
+  /** Noise-adaptive outlier cells (used for clustering / classification). */
+  outliers: ChangedCellDetail[];
+  /** Median cell deviation (noise floor). */
+  noiseMedian: number;
+  /** MAD of cell deviations. */
+  noiseMad: number;
   /** Max cellScore among changed cells (0 if none). */
   maxCellScore: number;
-  /** Connected components of changed cells (4-neighbour flood fill). */
+  /** Connected components of OUTLIER cells (4-neighbour flood fill). */
   clusters: ChangedCellCluster[];
   changedPercent: number;
   tamperScore: number;
@@ -53,13 +59,20 @@ export interface ClassifyImageChangeConfig {
   cellStrongLuma?: number;
   tamperMinClusterCells?: number;
   globalChangeMinPercent?: number;
-  /** Std-dev of lumaDelta among changed cells below this → consistent global shift. */
-  globalLumaStdMax?: number;
+  outlierK?: number;
+  outlierAbsFloor?: number;
 }
 
 export interface ClassifyImageChangeResult {
   classification: ImageChangeClass;
   reason: string;
+}
+
+export interface CompareCellsOptions {
+  hammingThreshold?: number;
+  lumaDeltaThreshold?: number;
+  outlierK?: number;
+  outlierAbsFloor?: number;
 }
 
 function bitsToHex64(bits: number[]): string {
@@ -200,15 +213,23 @@ export function cellSignatures(
   return cells;
 }
 
-export interface CompareCellsOptions {
-  hammingThreshold?: number;
-  lumaDeltaThreshold?: number;
+function medianOf(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 0) {
+    return (sorted[mid - 1]! + sorted[mid]!) / 2;
+  }
+  return sorted[mid]!;
 }
 
-/** 4-neighbour connected components over changed cell coordinates. */
-function clusterChangedCells(
-  details: ChangedCellDetail[],
-): ChangedCellCluster[] {
+function madOf(values: number[], med: number): number {
+  if (values.length === 0) return 0;
+  return medianOf(values.map((v) => Math.abs(v - med)));
+}
+
+/** 4-neighbour connected components over cell coordinates. */
+function clusterCells(details: ChangedCellDetail[]): ChangedCellCluster[] {
   if (details.length === 0) return [];
 
   const key = (x: number, y: number) => `${x},${y}`;
@@ -256,22 +277,9 @@ function clusterChangedCells(
   return clusters;
 }
 
-function sampleStdDev(values: number[]): number {
-  if (values.length === 0) return 0;
-  if (values.length === 1) return 0;
-  const mean = values.reduce((s, v) => s + v, 0) / values.length;
-  let sumSq = 0;
-  for (const v of values) {
-    const d = v - mean;
-    sumSq += d * d;
-  }
-  return Math.sqrt(sumSq / (values.length - 1));
-}
-
 /**
- * Compare cell signatures. Returns changed cells (hamming above threshold
- * OR mean luminance delta above threshold), changedPercent, tamperScore,
- * plus per-cell detail, maxCellScore, and connected clusters.
+ * Compare cell signatures. Returns weak-threshold changed cells (UI),
+ * noise-adaptive outliers, outlier clusters, changedPercent, tamperScore.
  */
 export function compareCells(
   orig: CellSignature[],
@@ -281,7 +289,16 @@ export function compareCells(
 ): CellCompareResult {
   const hamThresh = options.hammingThreshold ?? 12;
   const lumaThresh = options.lumaDeltaThreshold ?? 18;
+  // Tuned with JPEG q70 on harsh text pages: K=6 + ABS_FLOOR=0.15 keeps
+  // re-encode noise under the outlier bar; block edits still cluster.
+  // MAD floor (0.02): when MAD=0 (uniform shift), median+K*MAD collapses to
+  // median and half the grid becomes "outliers"; floor restores a gap.
+  const outlierK = options.outlierK ?? 6;
+  const absFloor = options.outlierAbsFloor ?? 0.15;
+  const madFloor = 0.02;
   const n = Math.min(orig.length, upload.length, gridSize * gridSize);
+
+  const allDetails: ChangedCellDetail[] = [];
   const changedCells: Array<{ x: number; y: number }> = [];
   const cellDetails: ChangedCellDetail[] = [];
   let hamSum = 0;
@@ -294,22 +311,34 @@ export function compareCells(
     const ham = hamming(o.dHash, u.dHash);
     const lumaDelta = Math.abs(o.meanLuma - u.meanLuma);
     hamSum += ham;
+    const x = i % gridSize;
+    const y = Math.floor(i / gridSize);
+    const cellScore = ham / 64 + lumaDelta / 255;
+    const detail: ChangedCellDetail = { x, y, ham, lumaDelta, cellScore };
+    allDetails.push(detail);
+
     const changed = ham > hamThresh || lumaDelta > lumaThresh;
     if (changed) {
-      const x = i % gridSize;
-      const y = Math.floor(i / gridSize);
-      const cellScore = ham / 64 + lumaDelta / 255;
       changedCells.push({ x, y });
-      cellDetails.push({ x, y, ham, lumaDelta, cellScore });
+      cellDetails.push(detail);
       scoreAccum += cellScore;
       if (cellScore > maxCellScore) maxCellScore = cellScore;
     }
   }
 
+  const deviations = allDetails.map((d) => d.cellScore);
+  const noiseMedian = medianOf(deviations);
+  const noiseMad = madOf(deviations, noiseMedian);
+  const effectiveMad = Math.max(noiseMad, madFloor);
+  const outlierThresh = noiseMedian + outlierK * effectiveMad * 1.4826;
+
+  const outliers = allDetails.filter(
+    (d) => d.cellScore > outlierThresh && d.cellScore > absFloor,
+  );
+
   const total = gridSize * gridSize;
   const changedPercent = total === 0 ? 0 : (changedCells.length / total) * 100;
   const visualDistance = n === 0 ? 0 : hamSum / n;
-  // tamperScore: scales with how many cells changed and how strongly
   const tamperScore =
     changedCells.length === 0
       ? 0
@@ -317,11 +346,15 @@ export function compareCells(
         (1 + scoreAccum / Math.max(1, changedCells.length)) *
         10;
 
-  const clusters = clusterChangedCells(cellDetails);
+  // Clusters from OUTLIERS only — not weak-threshold cells (JPEG noise).
+  const clusters = clusterCells(outliers);
 
   return {
     changedCells,
     cellDetails,
+    outliers,
+    noiseMedian,
+    noiseMad,
     maxCellScore,
     clusters,
     changedPercent,
@@ -337,10 +370,10 @@ export function compareCells(
  *
  * Evaluation order:
  * 1. UNCHANGED — no changed cells
- * 2. strong single-cell (a) → TAMPERED
- * 3. GLOBAL_ADJUSTMENT (before cluster rule — global filters touch many adjacent cells)
- * 4. connected cluster size (b) → TAMPERED
- * 5. legacy global tamperScore (c) → TAMPERED
+ * 2. strong single-cell → TAMPERED
+ * 3. GLOBAL_ADJUSTMENT — many weak changes, few/no strong outliers
+ * 4. outlier cluster size → TAMPERED
+ * 5. legacy global tamperScore → TAMPERED
  * 6. otherwise REENCODED
  */
 export function classifyImageChange(
@@ -348,18 +381,21 @@ export function classifyImageChange(
   cfg: ClassifyImageChangeConfig = {},
 ): ClassifyImageChangeResult {
   const tamperScoreAlert = cfg.tamperScoreAlert ?? 1.5;
-  // See config.ts CELL_STRONG_HAMMING — 48 avoids brightness/resize false TAMPERED.
   const cellStrongHamming = cfg.cellStrongHamming ?? 48;
   const cellStrongLuma = cfg.cellStrongLuma ?? 40;
   const tamperMinClusterCells = cfg.tamperMinClusterCells ?? 2;
   const globalChangeMinPercent = cfg.globalChangeMinPercent ?? 60;
-  const globalLumaStdMax = cfg.globalLumaStdMax ?? 8;
 
-  if (result.changedCells.length === 0) {
+  // Subtle localized edits can raise outliers without crossing weak thresholds.
+  if (result.changedCells.length === 0 && result.outliers.length === 0) {
     return { classification: "UNCHANGED", reason: "No changed cells" };
   }
 
-  const strong = result.cellDetails.find(
+  const strongPool =
+    result.cellDetails.length > 0
+      ? result.cellDetails
+      : result.outliers;
+  const strong = strongPool.find(
     (c) => c.ham > cellStrongHamming || c.lumaDelta > cellStrongLuma,
   );
   if (strong) {
@@ -369,16 +405,27 @@ export function classifyImageChange(
     };
   }
 
-  // Global brightness/contrast/filter: many cells, consistent luma shift, no strong cells.
-  // Checked before cluster size so a whole-image adjustment is not called TAMPERED.
-  if (result.changedPercent > globalChangeMinPercent) {
-    const lumaStd = sampleStdDev(result.cellDetails.map((c) => c.lumaDelta));
-    if (lumaStd < globalLumaStdMax) {
-      return {
-        classification: "GLOBAL_ADJUSTMENT",
-        reason: `${result.changedPercent.toFixed(1)}% of cells changed with consistent lumaDelta (std=${lumaStd.toFixed(2)}); likely brightness/contrast/filter`,
-      };
-    }
+  // Strong thresholds expressed as deviation for singleton-outlier gate.
+  const strongDevFloor =
+    cellStrongHamming / 64 + cellStrongLuma / 255;
+
+  const outliersAreBenign =
+    result.outliers.length === 0 ||
+    result.outliers.every((o) => {
+      const alone = !result.clusters.some(
+        (c) =>
+          c.size >= 2 && c.cells.some((p) => p.x === o.x && p.y === o.y),
+      );
+      return alone && o.cellScore < strongDevFloor;
+    });
+
+  // Global brightness/contrast/filter or uniform re-encode noise.
+  // Checked before outlier-cluster rule so widespread weak changes are not TAMPERED.
+  if (result.changedPercent > globalChangeMinPercent && outliersAreBenign) {
+    return {
+      classification: "GLOBAL_ADJUSTMENT",
+      reason: `${result.changedPercent.toFixed(1)}% of cells changed with ${result.outliers.length} outlier(s) (median=${result.noiseMedian.toFixed(3)}, MAD=${result.noiseMad.toFixed(3)}); likely brightness/contrast/re-encode`,
+    };
   }
 
   const largeCluster = result.clusters.find(
@@ -387,11 +434,17 @@ export function classifyImageChange(
   if (largeCluster) {
     return {
       classification: "TAMPERED",
-      reason: `Connected cluster of ${largeCluster.size} changed cell(s) (score=${largeCluster.score.toFixed(2)})`,
+      reason: `Connected outlier cluster of ${largeCluster.size} cell(s) (score=${largeCluster.score.toFixed(2)})`,
     };
   }
 
-  if (result.tamperScore >= tamperScoreAlert) {
+  // Legacy global score only when outliers exist — otherwise JPEG/re-encode
+  // can push tamperScore above alert with zero localized evidence.
+  if (
+    result.tamperScore >= tamperScoreAlert &&
+    result.outliers.length > 0 &&
+    !outliersAreBenign
+  ) {
     return {
       classification: "TAMPERED",
       reason: `Global tamperScore ${result.tamperScore.toFixed(2)} >= alert ${tamperScoreAlert}`,
@@ -400,6 +453,6 @@ export function classifyImageChange(
 
   return {
     classification: "REENCODED",
-    reason: `Isolated weak cell noise (${result.changedCells.length} cell(s), score=${result.tamperScore.toFixed(2)})`,
+    reason: `Isolated weak cell noise (${result.changedCells.length} cell(s), ${result.outliers.length} outlier(s), score=${result.tamperScore.toFixed(2)})`,
   };
 }

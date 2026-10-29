@@ -29,6 +29,7 @@ import {
   classifyImageChange,
   compareCells,
   decodeImage,
+  detectLocalizedPixelTamper,
   extract,
   isCertifiableImage,
   phash64,
@@ -36,6 +37,7 @@ import {
   type CellSignature,
   type ChangedCellCluster,
   type ImageChangeClass,
+  type LocalizedRegion,
 } from "../image";
 import { prisma } from "../prisma";
 
@@ -75,6 +77,10 @@ export interface ImageVerifyAnalysis {
   largestCluster?: Pick<ChangedCellCluster, "size" | "score"> & {
     cells?: Array<{ x: number; y: number }>;
   };
+  /** Pixel-stage bounding boxes (original coordinates). */
+  localizedRegions?: LocalizedRegion[];
+  /** True when pixel second-stage contributed to the verdict. */
+  pixelStageUsed?: boolean;
 }
 
 export interface VerifyResponse {
@@ -185,20 +191,26 @@ async function verifyImageAgainstCert(
   const uploadCells = cellSignatures(comparePixels, gridSize);
 
   let comparison;
+  let storedPixelsForPixelStage: Awaited<ReturnType<typeof decodeImage>> | null =
+    null;
   if (origCells && origCells.length === gridSize * gridSize) {
     comparison = compareCells(origCells, uploadCells, gridSize, {
       hammingThreshold: config.cellHammingThreshold,
       lumaDeltaThreshold: config.cellLumaDeltaThreshold,
+      outlierK: config.outlierK,
+      outlierAbsFloor: config.outlierAbsFloor,
     });
   } else {
     // Fallback: recompute from stored certified file
     try {
       const stored = await readStoredFileBuffer(cert);
-      const storedPixels = await decodeImage(stored);
-      const recomputed = cellSignatures(storedPixels, gridSize);
+      storedPixelsForPixelStage = await decodeImage(stored);
+      const recomputed = cellSignatures(storedPixelsForPixelStage, gridSize);
       comparison = compareCells(recomputed, uploadCells, gridSize, {
         hammingThreshold: config.cellHammingThreshold,
         lumaDeltaThreshold: config.cellLumaDeltaThreshold,
+        outlierK: config.outlierK,
+        outlierAbsFloor: config.outlierAbsFloor,
       });
     } catch (err) {
       console.error("[verifyImageAgainstCert] stored decode failed", err);
@@ -234,12 +246,14 @@ async function verifyImageAgainstCert(
     }
   }
 
-  const classified = classifyImageChange(comparison, {
+  let classified = classifyImageChange(comparison, {
     tamperScoreAlert: config.tamperScoreAlert,
     cellStrongHamming: config.cellStrongHamming,
     cellStrongLuma: config.cellStrongLuma,
     tamperMinClusterCells: config.tamperMinClusterCells,
     globalChangeMinPercent: config.globalChangeMinPercent,
+    outlierK: config.outlierK,
+    outlierAbsFloor: config.outlierAbsFloor,
   });
 
   const largest = comparison.clusters[0];
@@ -260,6 +274,54 @@ async function verifyImageAgainstCert(
       ? { size: largest.size, score: largest.score, cells: largest.cells }
       : undefined,
   };
+
+  // Pixel second stage: catch sub-cell edits when cell classifier is soft.
+  // Skip GLOBAL_ADJUSTMENT — whole-image shift/noise already decided; pixel
+  // absdiff would light up stripe/resample bands as false "regions".
+  if (
+    classified.classification !== "TAMPERED" &&
+    classified.classification !== "GLOBAL_ADJUSTMENT"
+  ) {
+    try {
+      if (!storedPixelsForPixelStage) {
+        const stored = await readStoredFileBuffer(cert);
+        storedPixelsForPixelStage = await decodeImage(stored);
+        if (
+          storedPixelsForPixelStage.width !== origW ||
+          storedPixelsForPixelStage.height !== origH
+        ) {
+          storedPixelsForPixelStage = await resizePixels(
+            storedPixelsForPixelStage,
+            origW,
+            origH,
+          );
+        }
+      }
+      const pixel = await detectLocalizedPixelTamper(
+        storedPixelsForPixelStage,
+        comparePixels,
+        {
+          minRegionArea: config.pixelMinRegionArea,
+          outlierK: config.outlierK,
+        },
+      );
+      analysis.pixelStageUsed = true;
+      if (pixel.tampered) {
+        classified = {
+          classification: "TAMPERED",
+          reason: pixel.reason,
+        };
+        analysis.changeClass = "TAMPERED";
+        analysis.reason = pixel.reason;
+        analysis.localizedRegions = pixel.regions;
+      } else {
+        analysis.reason = `${classified.reason}; ${pixel.reason}`;
+      }
+    } catch (err) {
+      console.error("[verifyImageAgainstCert] pixel stage failed", err);
+      analysis.reason = `${classified.reason}; pixel stage unavailable (stored file unreadable)`;
+    }
+  }
 
   if (classified.classification === "TAMPERED") {
     await logVerification(cert.certId, "TAMPERED", uploadedSha256);

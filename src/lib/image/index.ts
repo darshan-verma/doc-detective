@@ -22,6 +22,12 @@ export {
   type ClassifyImageChangeResult,
 } from "./fingerprint";
 export {
+  detectLocalizedPixelTamper,
+  type LocalizedRegion,
+  type PixelDiffOptions,
+  type PixelDiffResult,
+} from "./pixel-diff";
+export {
   embed,
   embedCertId,
   extract,

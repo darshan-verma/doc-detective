@@ -26,48 +26,67 @@ const envSchema = z.object({
   CELL_LUMA_DELTA_THRESHOLD: z.coerce.number().positive().default(18),
   /**
    * Single-cell Hamming above this → localized TAMPERED.
-   * Default 48 (not 20): uniform brightness clamping and 50% down/up resize
-   * routinely produce per-cell ham 24–40 on textured pages; those must reach
-   * GLOBAL_ADJUSTMENT. Localized block edits still trip cluster size ≥ 2.
+   * Default 48: brightness clamp / resize noise routinely hits ham 24–40.
+   * Zod is the SSOT — loadConfig must not ??-override this.
    */
   CELL_STRONG_HAMMING: z.coerce.number().int().positive().default(48),
   /** Single-cell luma delta above this → localized TAMPERED */
   CELL_STRONG_LUMA: z.coerce.number().positive().default(40),
-  /** Connected changed-cell cluster size that counts as tamper */
+  /** Connected outlier-cell cluster size that counts as tamper */
   TAMPER_MIN_CLUSTER_CELLS: z.coerce.number().int().positive().default(2),
-  /** % of grid changed above this + consistent luma → GLOBAL_ADJUSTMENT */
+  /** % of grid changed above this + few outliers → GLOBAL_ADJUSTMENT */
   GLOBAL_CHANGE_MIN_PERCENT: z.coerce.number().positive().default(60),
+  /**
+   * Outlier multiplier on MAD (robust z-score). K=6 keeps JPEG q70 noise
+   * under the floor while 64px+ block edits still form outlier clusters.
+   */
+  OUTLIER_K: z.coerce.number().positive().default(6),
+  /** Absolute minimum cell deviation to count as an outlier */
+  OUTLIER_ABS_FLOOR: z.coerce.number().positive().default(0.15),
+  /**
+   * Min connected pixel-diff region area at 1024×1024 reference; scales with
+   * image area. 80px catches ~24–32px digit erasures after blur/threshold.
+   */
+  PIXEL_MIN_REGION_AREA: z.coerce.number().int().positive().default(80),
   /** Default grid size for cell signatures */
   IMAGE_GRID_SIZE: z.coerce.number().int().positive().default(32),
   /** QIM quantization step for watermark embedding */
   WATERMARK_QIM_STEP: z.coerce.number().positive().default(24),
 });
 
+/**
+ * Pass raw process.env values (undefined when unset) so zod `.default()` is
+ * the single source of truth. Never `?? literal` for tunables — that silently
+ * overrides the schema default (e.g. CELL_STRONG_HAMMING 20 vs 48).
+ */
 function loadConfig() {
   const parsed = envSchema.safeParse({
     ED25519_PRIVATE_KEY: process.env.ED25519_PRIVATE_KEY,
-    ED25519_KEY_ID: process.env.ED25519_KEY_ID ?? "local-dev",
-    SIGNING_PROVIDER: process.env.SIGNING_PROVIDER ?? "local",
-    WATERMARK_KEY: process.env.WATERMARK_KEY ?? "dev-watermark-key-change-me",
-    MAX_UPLOAD_MB: process.env.MAX_UPLOAD_MB ?? 25,
-    STORAGE_DIR: process.env.STORAGE_DIR ?? "./storage",
-    STORAGE_PROVIDER: process.env.STORAGE_PROVIDER ?? "auto",
+    ED25519_KEY_ID: process.env.ED25519_KEY_ID,
+    SIGNING_PROVIDER: process.env.SIGNING_PROVIDER,
+    WATERMARK_KEY: process.env.WATERMARK_KEY,
+    MAX_UPLOAD_MB: process.env.MAX_UPLOAD_MB,
+    STORAGE_DIR: process.env.STORAGE_DIR,
+    STORAGE_PROVIDER: process.env.STORAGE_PROVIDER,
     DATABASE_URL: process.env.DATABASE_URL,
-    TSA_URL: process.env.TSA_URL ?? "https://freetsa.org/tsr",
-    CHECKPOINT_EVERY_N_ENTRIES: process.env.CHECKPOINT_EVERY_N_ENTRIES ?? 10,
+    TSA_URL: process.env.TSA_URL,
+    CHECKPOINT_EVERY_N_ENTRIES: process.env.CHECKPOINT_EVERY_N_ENTRIES,
     CRON_SECRET: process.env.CRON_SECRET,
     REDIS_URL: process.env.REDIS_URL,
-    WATERMARK_CONFIDENCE_MIN: process.env.WATERMARK_CONFIDENCE_MIN ?? 0.7,
-    PHASH_MATCH_MAX: process.env.PHASH_MATCH_MAX ?? 12,
-    TAMPER_SCORE_ALERT: process.env.TAMPER_SCORE_ALERT ?? 1.5,
-    CELL_HAMMING_THRESHOLD: process.env.CELL_HAMMING_THRESHOLD ?? 12,
-    CELL_LUMA_DELTA_THRESHOLD: process.env.CELL_LUMA_DELTA_THRESHOLD ?? 18,
-    CELL_STRONG_HAMMING: process.env.CELL_STRONG_HAMMING ?? 20,
-    CELL_STRONG_LUMA: process.env.CELL_STRONG_LUMA ?? 40,
-    TAMPER_MIN_CLUSTER_CELLS: process.env.TAMPER_MIN_CLUSTER_CELLS ?? 2,
-    GLOBAL_CHANGE_MIN_PERCENT: process.env.GLOBAL_CHANGE_MIN_PERCENT ?? 60,
-    IMAGE_GRID_SIZE: process.env.IMAGE_GRID_SIZE ?? 32,
-    WATERMARK_QIM_STEP: process.env.WATERMARK_QIM_STEP ?? 24,
+    WATERMARK_CONFIDENCE_MIN: process.env.WATERMARK_CONFIDENCE_MIN,
+    PHASH_MATCH_MAX: process.env.PHASH_MATCH_MAX,
+    TAMPER_SCORE_ALERT: process.env.TAMPER_SCORE_ALERT,
+    CELL_HAMMING_THRESHOLD: process.env.CELL_HAMMING_THRESHOLD,
+    CELL_LUMA_DELTA_THRESHOLD: process.env.CELL_LUMA_DELTA_THRESHOLD,
+    CELL_STRONG_HAMMING: process.env.CELL_STRONG_HAMMING,
+    CELL_STRONG_LUMA: process.env.CELL_STRONG_LUMA,
+    TAMPER_MIN_CLUSTER_CELLS: process.env.TAMPER_MIN_CLUSTER_CELLS,
+    GLOBAL_CHANGE_MIN_PERCENT: process.env.GLOBAL_CHANGE_MIN_PERCENT,
+    OUTLIER_K: process.env.OUTLIER_K,
+    OUTLIER_ABS_FLOOR: process.env.OUTLIER_ABS_FLOOR,
+    PIXEL_MIN_REGION_AREA: process.env.PIXEL_MIN_REGION_AREA,
+    IMAGE_GRID_SIZE: process.env.IMAGE_GRID_SIZE,
+    WATERMARK_QIM_STEP: process.env.WATERMARK_QIM_STEP,
   });
 
   if (!parsed.success) {
@@ -97,6 +116,9 @@ function loadConfig() {
     cellStrongLuma: parsed.data.CELL_STRONG_LUMA,
     tamperMinClusterCells: parsed.data.TAMPER_MIN_CLUSTER_CELLS,
     globalChangeMinPercent: parsed.data.GLOBAL_CHANGE_MIN_PERCENT,
+    outlierK: parsed.data.OUTLIER_K,
+    outlierAbsFloor: parsed.data.OUTLIER_ABS_FLOOR,
+    pixelMinRegionArea: parsed.data.PIXEL_MIN_REGION_AREA,
     imageGridSize: parsed.data.IMAGE_GRID_SIZE,
     watermarkQimStep: parsed.data.WATERMARK_QIM_STEP,
   };
